@@ -12,8 +12,11 @@
 //
 // The PC does all the heavy lifting (capture, scaling to 320x240, cursor
 // overlay, dirty-tile detection, JPEG encoding, zoom/viewport that follows
-// the mouse). The Cardputer only receives tiles, decodes them with
-// TJpg_Decoder straight onto the panel, and forwards the keyboard.
+// the mouse). The Cardputer only receives tiles and forwards the keyboard:
+//   core 0: rxTask() reads the TCP stream into two tile slots + an audio ring
+//   core 1: loop() decodes tiles with JPEGDEC while the previous MCU block is
+//           still going out to the panel over SPI DMA (ping-pong buffers)
+//   core 0: audioTask() plays the PC's sound (24 kHz mu-law) on the speaker
 //
 // External ILI9341 = the remote screen. Built-in Cardputer screen = status
 // HUD (mode, zoom, fps, key hints). Servers are found by UDP broadcast, and a
@@ -38,12 +41,13 @@
 //   Opt + 1  next monitor
 //   Opt + 9  image quality                   Opt + 8  backlight
 //   Opt + Enter  full refresh                Opt + `  disconnect
+//   Opt + [ / ]  volume down / up            Opt + \  sound on/off
 //   MOUSE mode: ; . , / move (accelerates, Shift = slow), Enter/Space = left
 //   button (hold to drag), \ = right, ' = middle, [ ] = wheel. Every other
 //   key still types.
 //
-// BUILD: FQBN esp32:esp32:m5stack_cardputer, libraries M5Cardputer,
-// Adafruit ILI9341 + GFX, TJpg_Decoder.
+// BUILD: FQBN esp32:esp32:m5stack_cardputer, libraries M5Cardputer (M5GFX,
+// which also drives the external panel) and JPEGDEC.
 // ============================================================================
 
 #include <Arduino.h>
@@ -52,9 +56,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
-#include <TJpg_Decoder.h>
+#include <lgfx/v1/panel/Panel_LCD.hpp>
+#include <JPEGDEC.h>
 #include <mbedtls/md.h>
 #include <vector>
 
@@ -70,34 +73,105 @@
 
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
-constexpr uint8_t PROTO_VER = 2;
-#define CXL_REMOTE_VERSION "1.0.0"
+constexpr uint8_t PROTO_VER = 3;
+#define CXL_REMOTE_VERSION "1.1.0"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
 constexpr uint8_t BL_BITS = 8;
 
-constexpr uint16_t C_BG = ILI9341_BLACK;
+constexpr uint16_t C_BG = 0x0000;
 constexpr uint16_t C_BAR = 0x0233;
 constexpr uint16_t C_ACC = 0x2E7F;
-constexpr uint16_t C_TXT = ILI9341_WHITE;
+constexpr uint16_t C_TXT = 0xFFFF;
 constexpr uint16_t C_DIM = 0x8C71;
 constexpr uint16_t C_SEL = 0x1A6B;
 constexpr uint16_t C_ERR = 0xFA48;
 constexpr uint16_t C_OK = 0x47E8;
 
-Adafruit_ILI9341 tft(&SPI, TFT_DC, TFT_CS, TFT_RST);
+// ---- External ILI9341 through M5GFX's own lgfx classes (no second graphics
+// library, so no clash with M5GFX). It gets SPI2 + DMA to itself; the
+// built-in screen is on SPI3. Init sequence copied from LovyanGFX's
+// Panel_ILI9341 (FreeBSD licence, lovyan03) - M5GFX only ships ILI9342.
+struct Panel_ILI9341_XL : public lgfx::Panel_LCD {
+  Panel_ILI9341_XL() {
+    _cfg.memory_width = _cfg.panel_width = 240;
+    _cfg.memory_height = _cfg.panel_height = 320;
+  }
+  const uint8_t* getInitCommands(uint8_t listno) const override {
+    static constexpr uint8_t list0[] = {
+      0xEF, 3, 0x03, 0x80, 0x02,
+      0xCF, 3, 0x00, 0xC1, 0x30,
+      0xED, 4, 0x64, 0x03, 0x12, 0x81,
+      0xE8, 3, 0x85, 0x00, 0x78,
+      0xCB, 5, 0x39, 0x2C, 0x00, 0x34, 0x02,
+      0xF7, 1, 0x20,
+      0xEA, 2, 0x00, 0x00,
+      0xC0, 1, 0x23,
+      0xC1, 1, 0x10,
+      0xC5, 2, 0x3e, 0x28,
+      0xC7, 1, 0x86,
+      0xB1, 2, 0x00, 0x13,
+      0xF2, 1, 0x00,
+      CMD_GAMMASET, 1, 0x01,
+      0xE0, 15, 0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00,
+      0xE1, 15, 0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F,
+      0xB6, 3, 0x08, 0xC2, 0x27,
+      CMD_SLPOUT, 0 + CMD_INIT_DELAY, 120,
+      CMD_IDMOFF, 0,
+      CMD_DISPON, 0 + CMD_INIT_DELAY, 100,
+      0xFF, 0xFF,
+    };
+    return listno == 0 ? list0 : nullptr;
+  }
+};
+
+class ExtPanel : public lgfx::LGFX_Device {
+  Panel_ILI9341_XL _panel;
+  lgfx::Bus_SPI _bus;
+public:
+  ExtPanel() {
+    auto b = _bus.config();
+    b.spi_host = SPI2_HOST;
+    b.spi_mode = 0;
+    b.freq_write = 40000000;
+    b.freq_read = 16000000;
+    b.spi_3wire = false;
+    b.use_lock = true;
+    b.dma_channel = SPI_DMA_CH_AUTO;
+    b.pin_sclk = TFT_SCK;
+    b.pin_mosi = TFT_MOSI;
+    b.pin_miso = -1;
+    b.pin_dc = TFT_DC;
+    _bus.config(b);
+    _panel.setBus(&_bus);
+    auto p = _panel.config();
+    p.pin_cs = TFT_CS;
+    p.pin_rst = TFT_RST;
+    p.pin_busy = -1;
+    p.readable = false;
+    p.invert = false;
+    p.rgb_order = false;
+    p.dlen_16bit = false;
+    p.bus_shared = false;
+    _panel.config(p);
+    setPanel(&_panel);
+  }
+};
+
+ExtPanel tft;
 M5Canvas hud(&M5Cardputer.Display);
 Preferences prefs;
 WiFiClient conn;
 WiFiUDP udp;
-uint8_t* jpegBuf = nullptr;
+JPEGDEC jpeg;
 
 // ---- Persistent settings ----
 String wifiSsid, wifiPass, serverPin;
 IPAddress lastServerIp;
 uint16_t lastServerPort = REMOTE_PORT;
-uint8_t rotation = 3, brightness = 10, quality = 1;
+uint8_t rotation = 3, brightness = 10, quality = 1, volume = 128;
+bool soundOn = true;
 const char* qualityNames[] = {"FAST", "NORMAL", "SHARP"};
 
 // ---- Session / HUD state ----
@@ -106,7 +180,7 @@ uint16_t serverScreenW = 0, serverScreenH = 0;
 bool mouseMode = false, inSession = false, hudDirty = true;
 uint16_t viewRatioX100 = 0;
 uint8_t zoomIdx = 0, zoomCount = 1, monitorNo = 1;
-bool stretchOn = false;
+bool stretchOn = false, audioStreaming = false;
 uint32_t statFrames = 0, statBytes = 0, statT0 = 0;
 float fps = 0, kbps = 0;
 String lastKeyLabel;
@@ -131,6 +205,8 @@ void saveSettings() {
   prefs.putUShort("srv_port", lastServerPort);
   prefs.putUChar("bright", brightness);
   prefs.putUChar("quality", quality);
+  prefs.putUChar("volume", volume);
+  prefs.putBool("sound", soundOn);
   prefs.end();
 }
 
@@ -144,6 +220,8 @@ void loadSettings() {
     lastServerPort = prefs.getUShort("srv_port", REMOTE_PORT);
     savedBright = prefs.getUChar("bright", 0);
     quality = min<uint8_t>(prefs.getUChar("quality", 1), 2);
+    volume = prefs.getUChar("volume", volume);
+    soundOn = prefs.getBool("sound", soundOn);
     prefs.end();
   }
   // CardputerXL's own settings: Wi-Fi it already knows, panel rotation and
@@ -257,12 +335,13 @@ void drawHud() {
   hud.setCursor(4, 61);
   hud.printf("%4.1f fps  %4.0f KB/s  Q:%s", fps, kbps, qualityNames[quality]);
   hud.setCursor(4, 72); hud.setTextColor((uint16_t)0x8C71);
-  hud.print(("key: " + lastKeyLabel).substring(0, 39));
+  String snd = !soundOn ? String("MUTE") : (audioStreaming ? "VOL " + String(volume * 100 / 255) + "%" : String("no audio"));
+  hud.print((snd + "  key: " + lastKeyLabel).substring(0, 39));
 
   hud.setTextColor((uint16_t)0x2E7F);
   const char* const* lines;
   static const char* keyHints[] = {"Fn+;.,/ arrows  Fn+` Esc  Fn+1-= F1-12",
-                                   "Fn+Del Delete  Fn+[] PgUp/Dn  Fn+H/E",
+                                   "Fn+Del Del Fn+[] PgUp/Dn Opt+[]\\ sound",
                                    "Opt=Win Opt+Spc/G0 mouse Opt+-= zoom",
                                    "Opt+0 fit/stretch Opt+9 qual Opt+` quit"};
   static const char* mouseHints[] = {";.,/ move (Shift slow)  Ent/Spc left",
@@ -608,6 +687,7 @@ void toggleMouseMode() { mouseMode = !mouseMode; haptic(mouseMode ? 35 : 20); hu
 void cycleBrightness() { brightness = brightness >= 10 ? 2 : min(10, brightness + 2); applyBrightness(); saveSettings(); }
 
 // Opt + key: local command? Returns true when handled.
+void sendSoundWanted();
 bool optCommand(uint8_t c) {
   switch (c) {
     case '`': exitRequested = true; return true;
@@ -619,6 +699,10 @@ bool optCommand(uint8_t c) {
     case '9': quality = (quality + 1) % 3; sendQuality(); saveSettings(); hudDirty = true; haptic(); return true;
     case '8': cycleBrightness(); haptic(); return true;
     case KEY_ENTER: sendMsg('R', nullptr, 0); haptic(); return true;
+    case '[': case ']':
+      volume = c == '[' ? (volume > 16 ? volume - 16 : 0) : min(255, volume + 16);
+      M5Cardputer.Speaker.setVolume(volume); saveSettings(); hudDirty = true; return true;
+    case '\\': soundOn = !soundOn; sendSoundWanted(); saveSettings(); hudDirty = true; haptic(); return true;
   }
   return false;
 }
@@ -730,89 +814,202 @@ void serviceInput() {
 }
 
 // ============================================================================
-// Session: incoming stream  'T' tile | 'F' frame end | 'H' heartbeat | 'X' bye
+// Session: incoming stream, read by rxTask() on core 0 so TCP keeps flowing
+// while loop() on core 1 decodes and draws.
+//   'T' tile | 'F' frame end | 'S' audio | 'H' heartbeat | 'X' bye
 // ============================================================================
-enum RxState { RX_TYPE, RX_HDR, RX_BODY };
-RxState rxState = RX_TYPE;
-uint8_t rxType = 0, rxHdr[16];
-int rxHdrNeed = 0, rxHdrGot = 0;
-uint32_t rxBodyLen = 0, rxBodyGot = 0, lastRxAt = 0, lastPingAt = 0;
-uint16_t tileX, tileY, tileW, tileH;
+constexpr int TILE_SLOTS = 2;  // one being filled from the network, one being drawn
+uint8_t* tileSlot[TILE_SLOTS];
+struct RxItem { uint8_t type, slot; uint16_t x, y; uint32_t len; uint8_t hdr[11]; };
+QueueHandle_t rxQueue = nullptr, freeSlots = nullptr;
+volatile bool rxStop = false, rxRunning = false;
+volatile uint32_t rxBytes = 0, lastRxAt = 0;
+const char* volatile rxError = "";
+uint32_t lastPingAt = 0;
 uint8_t byeReason = 255;  // 255 = no goodbye received (connection just dropped)
-
-bool jpgOut(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
-  if (x < 0 || y < 0 || x + w > OUT_W || y + h > OUT_H) return true;
-  tft.setAddrWindow(x, y, w, h);
-  tft.writePixels(bmp, (uint32_t)w * h);
-  return true;
-}
-
-int headerSize(uint8_t t) {
-  switch (t) { case 'T': return 12; case 'F': return 11; case 'H': return 0; case 'X': return 1; }
-  return -1;
-}
 
 static inline uint16_t rd16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static inline uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 
-// Returns false on protocol error / server goodbye.
-bool handleHeader() {
-  switch (rxType) {
-    case 'T':
-      tileX = rd16(rxHdr); tileY = rd16(rxHdr + 2); tileW = rd16(rxHdr + 4); tileH = rd16(rxHdr + 6);
-      rxBodyLen = rd32(rxHdr + 8);
-      if (rxBodyLen == 0 || rxBodyLen > JPEG_MAX) { connError = "Tile too big"; return false; }
-      rxBodyGot = 0;
-      rxState = RX_BODY;
-      return true;
-    case 'F': {
-      uint8_t ack[4]; memcpy(ack, rxHdr, 4);
-      sendMsg('A', ack, 4);
-      uint16_t ratio = rd16(rxHdr + 4);
-      bool stretch = rxHdr[10] & 1;
-      if (ratio != viewRatioX100 || rxHdr[6] != zoomIdx || rxHdr[9] != monitorNo || stretch != stretchOn) hudDirty = true;
-      stretchOn = stretch;
-      viewRatioX100 = ratio; zoomIdx = rxHdr[6]; zoomCount = rxHdr[7]; monitorNo = rxHdr[9];
-      if (rxHdr[8] != quality && rxHdr[8] < 3) { quality = rxHdr[8]; hudDirty = true; }
-      ++statFrames;
-      break;
-    }
-    case 'X': byeReason = rxHdr[0]; connError = byeReason == 2 ? "Another client took over" : (byeReason == 0 ? "Disconnected by the PC" : "Server closed session"); return false;
+// ---- Audio: 24 kHz mono mu-law -> ring buffer -> M5 speaker -------------------
+constexpr uint32_t AUDIO_RATE = 24000;
+constexpr uint32_t AUDIO_RING = 16384;            // power of two, ~680 ms
+constexpr uint32_t AUDIO_CHUNK = 480;             // 20 ms per playRaw()
+constexpr uint32_t AUDIO_PRIME = AUDIO_CHUNK * 6; // 120 ms jitter buffer before (re)starting
+constexpr uint32_t AUDIO_LATE = AUDIO_CHUNK * 18; // > 360 ms queued: skip ahead (clock drift)
+constexpr int AUDIO_BUFS = 4;                     // playing + queued + one being filled, +1 spare
+constexpr uint8_t AUDIO_CH = 0;
+uint8_t* audioRing = nullptr;
+int16_t* audioPlay[AUDIO_BUFS];
+int16_t ulawTable[256];
+volatile uint32_t audioHead = 0, audioTail = 0;   // free-running; head = rxTask, tail = audioTask
+volatile bool audioRun = false, audioAlive = false;
+
+void buildUlawTable() {
+  // Inverse of the server's continuous mu-law (mu = 255): q 0..255 -> pcm.
+  for (int q = 0; q < 256; ++q) {
+    float y = q / 255.0f * 2.0f - 1.0f;
+    float x = (powf(256.0f, fabsf(y)) - 1.0f) / 255.0f;
+    ulawTable[q] = (int16_t)((y < 0 ? -x : x) * 32000.0f);
   }
-  rxState = RX_TYPE;
+}
+
+void audioTask(void*) {
+  int k = 0;
+  bool primed = false;
+  while (audioRun) {
+    uint32_t avail = audioHead - audioTail;
+    if (avail > AUDIO_LATE) { audioTail = audioHead - AUDIO_PRIME; avail = AUDIO_PRIME; }
+    if (!primed) primed = avail >= AUDIO_PRIME;
+    else if (avail < AUDIO_CHUNK) primed = false;  // underrun: rebuild the jitter buffer
+    if (primed && M5Cardputer.Speaker.isPlaying(AUDIO_CH) < 2) {
+      int16_t* out = audioPlay[k];
+      uint32_t t = audioTail;
+      for (uint32_t i = 0; i < AUDIO_CHUNK; ++i) out[i] = ulawTable[audioRing[(t + i) & (AUDIO_RING - 1)]];
+      audioTail = t + AUDIO_CHUNK;
+      M5Cardputer.Speaker.playRaw(out, AUDIO_CHUNK, AUDIO_RATE, false, 1, AUDIO_CH, false);
+      k = (k + 1) % AUDIO_BUFS;
+      continue;
+    }
+    vTaskDelay(pdMS_TO_TICKS(3));
+  }
+  M5Cardputer.Speaker.stop(AUDIO_CH);
+  audioAlive = false;
+  vTaskDelete(nullptr);
+}
+
+void startAudio() {
+  audioHead = audioTail = 0;
+  M5Cardputer.Speaker.setVolume(volume);
+  audioRun = audioAlive = true;
+  xTaskCreatePinnedToCore(audioTask, "cxl_audio", 3072, nullptr, 4, nullptr, 0);
+}
+void stopAudio() {
+  audioRun = false;
+  while (audioAlive) delay(1);
+}
+void sendSoundWanted() { uint8_t p[1] = {(uint8_t)soundOn}; sendMsg('U', p, 1); }
+
+// ---- Network task --------------------------------------------------------------
+bool rxRead(uint8_t* dst, size_t n) {
+  while (n) {
+    if (rxStop) return false;
+    int r = conn.read(dst, n);
+    if (r > 0) { dst += r; n -= r; rxBytes += r; lastRxAt = millis(); continue; }
+    if (!conn.connected()) { rxError = "Connection lost"; return false; }
+    if (millis() - lastRxAt > 8000) { rxError = "Server stopped responding"; return false; }
+    vTaskDelay(1);
+  }
   return true;
 }
 
-bool serviceRx() {
-  uint32_t t0 = millis();
-  while (millis() - t0 < 8) {
-    int avail = conn.available();
-    if (avail <= 0) break;
-    lastRxAt = millis();
-    if (rxState == RX_TYPE) {
-      rxType = conn.read();
-      rxHdrNeed = headerSize(rxType);
-      rxHdrGot = 0;
-      statBytes += 1;
-      if (rxHdrNeed < 0) { connError = "Protocol error"; return false; }
-      if (rxHdrNeed == 0) { if (!handleHeader()) return false; }
-      else rxState = RX_HDR;
-    } else if (rxState == RX_HDR) {
-      int r = conn.read(rxHdr + rxHdrGot, min(avail, rxHdrNeed - rxHdrGot));
-      if (r <= 0) break;
-      rxHdrGot += r; statBytes += r;
-      if (rxHdrGot == rxHdrNeed && !handleHeader()) return false;
-    } else {
-      int r = conn.read(jpegBuf + rxBodyGot, min<uint32_t>(avail, rxBodyLen - rxBodyGot));
-      if (r <= 0) break;
-      rxBodyGot += r; statBytes += r;
-      if (rxBodyGot == rxBodyLen) {
-        tft.startWrite();
-        TJpgDec.drawJpg(tileX, tileY, jpegBuf, rxBodyLen);
-        tft.endWrite();
-        rxState = RX_TYPE;
-        break;  // give the keyboard a turn after every decoded tile
+bool rxPush(const RxItem& it) {
+  while (xQueueSend(rxQueue, &it, pdMS_TO_TICKS(50)) != pdTRUE) if (rxStop) return false;
+  return true;
+}
+
+void rxTask(void*) {
+  RxItem it = {};
+  uint8_t type, hdr[12], scratch[256];
+  bool ok = true;
+  while (ok && !rxStop) {
+    if (!rxRead(&type, 1)) break;
+    switch (type) {
+      case 'T': {
+        if (!(ok = rxRead(hdr, 12))) break;
+        uint32_t len = rd32(hdr + 8);
+        if (!len || len > JPEG_MAX) { rxError = "Tile too big"; ok = false; break; }
+        uint8_t slot;
+        while (xQueueReceive(freeSlots, &slot, pdMS_TO_TICKS(50)) != pdTRUE) if (rxStop) { ok = false; break; }
+        if (!ok) break;
+        if (!(ok = rxRead(tileSlot[slot], len))) { xQueueSend(freeSlots, &slot, 0); break; }
+        it.type = 'T'; it.slot = slot; it.x = rd16(hdr); it.y = rd16(hdr + 2); it.len = len;
+        ok = rxPush(it);
+        break;
       }
+      case 'F':
+        if (!(ok = rxRead(it.hdr, 11))) break;
+        it.type = 'F';
+        ok = rxPush(it);
+        break;
+      case 'S': {
+        if (!(ok = rxRead(hdr, 2))) break;
+        uint32_t len = rd16(hdr);
+        uint32_t space = AUDIO_RING - 1 - (audioHead - audioTail);
+        if (audioRun && len <= space) {
+          // Straight into the ring (in at most two pieces at the wrap point).
+          uint32_t h = audioHead, first = min(len, AUDIO_RING - (h & (AUDIO_RING - 1)));
+          if (!(ok = rxRead(audioRing + (h & (AUDIO_RING - 1)), first))) break;
+          if (first < len && !(ok = rxRead(audioRing, len - first))) break;
+          audioHead = h + len;
+        } else {
+          while (len && ok) { uint32_t n = min<uint32_t>(len, sizeof(scratch)); ok = rxRead(scratch, n); len -= n; }
+        }
+        break;
+      }
+      case 'H':
+        break;
+      case 'X':
+        if (!(ok = rxRead(hdr, 1))) break;
+        it.type = 'X'; it.hdr[0] = hdr[0];
+        rxPush(it);
+        ok = false;
+        rxError = nullptr;
+        break;
+      default:
+        rxError = "Protocol error";
+        ok = false;
+    }
+  }
+  if (!rxStop && rxError) { it.type = 'E'; rxPush(it); }
+  rxRunning = false;
+  vTaskDelete(nullptr);
+}
+
+// ---- Drawing: JPEGDEC hands over MCU blocks in a ping-pong buffer, so the SPI
+// DMA of one block overlaps with decoding the next.
+int jpegDraw(JPEGDRAW* d) {
+  tft.pushImageDMA(d->x, d->y, d->iWidth, d->iHeight, (const lgfx::swap565_t*)d->pPixels);
+  return 1;
+}
+
+void drawTile(const RxItem& it) {
+  if (!jpeg.openRAM(tileSlot[it.slot], it.len, jpegDraw)) return;
+  jpeg.setPixelType(RGB565_BIG_ENDIAN);
+  tft.startWrite();
+  jpeg.decode(it.x, it.y, JPEG_USES_DMA);
+  tft.endWrite();  // waits for the last DMA block
+  jpeg.close();
+}
+
+// Returns false when the session is over.
+bool serviceRx() {
+  RxItem it;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 12 && xQueueReceive(rxQueue, &it, 0) == pdTRUE) {
+    switch (it.type) {
+      case 'T':
+        drawTile(it);
+        xQueueSend(freeSlots, &it.slot, 0);
+        break;
+      case 'F': {
+        sendMsg('A', it.hdr, 4);  // ack only after every tile of the frame is on screen
+        uint16_t ratio = rd16(it.hdr + 4);
+        bool stretch = it.hdr[10] & 1, audio = it.hdr[10] & 2;
+        if (ratio != viewRatioX100 || it.hdr[6] != zoomIdx || it.hdr[9] != monitorNo || stretch != stretchOn || audio != audioStreaming) hudDirty = true;
+        stretchOn = stretch; audioStreaming = audio;
+        viewRatioX100 = ratio; zoomIdx = it.hdr[6]; zoomCount = it.hdr[7]; monitorNo = it.hdr[9];
+        if (it.hdr[8] != quality && it.hdr[8] < 3) { quality = it.hdr[8]; hudDirty = true; }
+        ++statFrames;
+        break;
+      }
+      case 'X':
+        byeReason = it.hdr[0];
+        connError = byeReason == 2 ? "Another client took over" : (byeReason == 0 ? "Disconnected by the PC" : "Server closed session");
+        return false;
+      case 'E':
+        connError = rxError ? rxError : "Connection lost";
+        return false;
     }
   }
   return true;
@@ -820,34 +1017,45 @@ bool serviceRx() {
 
 void runSession() {
   inSession = true; exitRequested = false; byeReason = 255;
-  mouseMode = false; rxState = RX_TYPE;
+  mouseMode = false; audioStreaming = false;
   sessPrevMask = readKeyMask();  // keys still held from the menu are ignored
   for (auto& a : acts) a.kind = A_NONE;
   optUsed = optWinDown = false;
   lastRxAt = lastPingAt = statT0 = millis();
-  statFrames = statBytes = 0; fps = kbps = 0;
+  statFrames = 0; rxBytes = 0; fps = kbps = 0;
   lastKeyLabel = "";
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(C_BG);
+
+  xQueueReset(rxQueue);
+  xQueueReset(freeSlots);
+  for (uint8_t i = 0; i < TILE_SLOTS; ++i) xQueueSend(freeSlots, &i, 0);
+  rxStop = false; rxRunning = true; rxError = "Connection lost";
+  xTaskCreatePinnedToCore(rxTask, "cxl_rx", 4096, nullptr, 5, nullptr, 0);
+  startAudio();
+
   sendQuality();
+  sendSoundWanted();
   hudDirty = true;
   haptic(40);
   while (true) {
-    if (!conn.connected() && conn.available() <= 0) { connError = "Connection lost"; break; }
     if (!serviceRx()) break;
     serviceInput();
     if (exitRequested) { connError = ""; break; }
     uint32_t now = millis();
     if (now - lastPingAt > 2000) { sendMsg('P', nullptr, 0); lastPingAt = now; }
-    if (now - lastRxAt > 8000) { connError = "Server stopped responding"; break; }
     if (now - statT0 >= 1000) {
       fps = statFrames * 1000.0f / (now - statT0);
-      kbps = statBytes / 1.024f / (now - statT0);
-      statFrames = statBytes = 0; statT0 = now;
+      kbps = rxBytes / 1.024f / (now - statT0);
+      statFrames = 0; rxBytes = 0; statT0 = now;
       hudDirty = true;
     }
     serviceHud();
     serviceHaptic();
+    if (uxQueueMessagesWaiting(rxQueue) == 0) delay(1);
   }
+  rxStop = true;
+  while (rxRunning) delay(1);
+  stopAudio();
   if (conn.connected()) releaseAll();
   conn.stop();
   inSession = false;
@@ -944,9 +1152,10 @@ void setup() {
   pinMode(HAPTIC_PIN, OUTPUT);
   digitalWrite(HAPTIC_PIN, LOW);
 
-  SPI.begin(TFT_SCK, -1, TFT_MOSI, TFT_CS);
-  tft.begin();
-  tft.setRotation(rotation);
+  tft.init();
+  // CardputerXL's saved rotation is in Adafruit_ILI9341 terms; with this init
+  // sequence lgfx lands 180 degrees off, so flip it (3 <-> 1).
+  tft.setRotation((rotation + 2) & 3);
   tft.setTextWrap(false);
   tft.fillScreen(C_BG);
   ledcAttach(TFT_BL, BL_HZ, BL_BITS);
@@ -955,15 +1164,20 @@ void setup() {
   hud.setColorDepth(8);
   hud.createSprite(240, 135);
 
-  jpegBuf = (uint8_t*)malloc(JPEG_MAX);
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setSwapBytes(false);  // writePixels() already sends big-endian
-  TJpgDec.setCallback(jpgOut);
+  bool memOk = true;
+  for (int i = 0; i < TILE_SLOTS; ++i) memOk &= (tileSlot[i] = (uint8_t*)malloc(JPEG_MAX)) != nullptr;
+  memOk &= (audioRing = (uint8_t*)malloc(AUDIO_RING)) != nullptr;
+  for (int i = 0; i < AUDIO_BUFS; ++i) memOk &= (audioPlay[i] = (int16_t*)malloc(AUDIO_CHUNK * 2)) != nullptr;
+  rxQueue = xQueueCreate(8, sizeof(RxItem));
+  freeSlots = xQueueCreate(TILE_SLOTS, 1);
+  buildUlawTable();
+  M5Cardputer.Speaker.begin();
+  M5Cardputer.Speaker.setVolume(volume);
 
   for (int i = 0; i < KEY_COUNT; ++i) acts[i].kind = A_NONE;
 
   uiMessage("CXL REMOTE", "Remote desktop", "for the Cardputer XL  -  v" CXL_REMOTE_VERSION);
-  if (!jpegBuf) { uiMessage("ERROR", "Out of memory", "", C_ERR); while (true) delay(1000); }
+  if (!memOk) { uiMessage("ERROR", "Out of memory", "", C_ERR); while (true) delay(1000); }
   delay(400);
   while (!connectWifi()) wifiSetup();
 }

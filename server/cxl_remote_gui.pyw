@@ -163,6 +163,9 @@ class App:
 
         ctl = ttk.LabelFrame(right, text="Control", padding=8)
         ctl.pack(fill="x", pady=(10, 0))
+        self.var_audio = tk.BooleanVar(value=self.server.cfg["audio"])
+        ttk.Checkbutton(ctl, text="Send PC sound to the Cardputer speaker", variable=self.var_audio,
+                        command=lambda: self.server.set_option(audio=self.var_audio.get())).pack(anchor="w")
         self.var_viewonly = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctl, text="View only (ignore Cardputer keyboard / mouse)", variable=self.var_viewonly,
                         command=lambda: setattr(self.server, "view_only", self.var_viewonly.get())).pack(anchor="w")
@@ -265,7 +268,8 @@ class App:
                                   foreground=OK)
             self.stats.configure(text=f"{s.fps:4.1f} fps   {s.kbps:5.0f} KB/s   {s.view_label}   "
                                       f"monitor {s.mon_idx % max(1, len(self.monitors)) + 1}   "
-                                      f"quality {core.QUALITY_NAMES[s.quality]}   {up // 60}:{up % 60:02d}")
+                                      f"quality {core.QUALITY_NAMES[s.quality]}   "
+                                      f"sound {'on' if s.audio_active else 'off'}   {up // 60}:{up % 60:02d}")
             # follow changes the Cardputer made itself
             if self.var_stretch.get() != s.stretch:
                 self.var_stretch.set(s.stretch)

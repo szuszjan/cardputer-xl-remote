@@ -11,20 +11,21 @@ over TCP 5901. Allow Python through the firewall on *private* networks only:
 anyone who knows the PIN can control this PC. Input into elevated (admin)
 windows is blocked by Windows unless this script runs as administrator.
 
-Protocol v2 (little-endian):
+Protocol v3 (little-endian):
   S->C  "CXLS" ver nonce[16]
   C->S  "CXLR" ver w:u16 h:u16 maxjpeg:u32 hmac_sha256(pin, nonce)[32]
   S->C  'O' screen_w:u16 screen_h:u16 namelen:u8 name   |  'X' reason:u8 (1 = bad PIN)
   then
   S->C  'T' x y w h:u16 len:u32 jpeg      tile
         'F' id:u32 ratio_x100:u16 zoom_idx zoom_count quality monitor flags (u8 each)
-            flags bit0 = stretch-to-fit active
+            flags bit0 = stretch-to-fit active, bit1 = sound streaming
+        'S' len:u16 audio                 24 kHz mono, continuous mu-law (mu=255) bytes
         'H'                               heartbeat
         'X' reason:u8                     goodbye (2 = replaced by another client)
   C->S  [type:u8][len:u8][payload]
         'K' down:u8 name    'M' dx8:i16 dy8:i16 (1/8 view px)   'B' button down
         'W' v:i8 h:i8       'Z' zoom:i8 (+1 in, -1 out, 0 fit; 0 at fit toggles stretch)
-        'Q' quality         'N' next monitor    'R' full refresh
+        'Q' quality         'N' next monitor    'R' full refresh   'U' want sound:u8
         'A' frame ack id:u32   'P' ping
 """
 
@@ -43,16 +44,19 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.0.0"
-PROTO_VER = 2
+VERSION = "1.1.0"
+PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
 ZOOM_RATIOS = (4.0, 3.0, 2.0, 1.5, 1.0)  # screen px per panel px, below "fit"
 QUALITY = ((45, 2), (70, 0), (88, 0))    # (jpeg quality, subsampling 2=4:2:0 0=4:4:4)
 QUALITY_NAMES = ("Fast", "Normal", "Sharp")
+MOTION_QUALITY_DROP = 30   # big changes (video, scrolling) go out at q-30, 4:2:0 ...
+REFINE_AFTER = 0.25        # ... and get re-sent sharp once the screen holds still
+AUDIO_RATE, AUDIO_BLOCK = 24000, 480
 MAX_INFLIGHT = 2
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".cxl_remote.json")
-DEFAULTS = {"pin": "", "require_pin": True, "port": PORT, "fps": 25, "stretch": False}
+DEFAULTS = {"pin": "", "require_pin": True, "port": PORT, "fps": 25, "stretch": False, "audio": True}
 
 try:
     LANCZOS = Image.Resampling.LANCZOS
@@ -251,36 +255,42 @@ def jpeg(img, quality, subsampling):
     return buf.getvalue()
 
 
-def dirty_rects(prev, cur, ow, oh):
-    """Changed regions on a TILE_W x TILE_H grid, merged into vertical runs of
-    band rows (fewer JPEGs = less header overhead)."""
+def dirty_tiles(prev, cur, ow, oh):
+    """Set of (tx, ty) grid cells that differ between two RGB byte buffers."""
     row = ow * 3
     cols = ow // TILE_W
-    spans = []
+    tiles = set()
     for by in range(oh // TILE_H):
         s, e = by * TILE_H * row, (by + 1) * TILE_H * row
         if prev is None:
-            spans.append((0, cols - 1))
+            tiles.update((tx, by) for tx in range(cols))
             continue
         if prev[s:e] == cur[s:e]:
-            spans.append(None)
             continue
-        lo = hi = None
         for tx in range(cols):
             x0 = tx * TILE_W * 3
             for r in range(TILE_H):
                 o = s + r * row + x0
                 if prev[o:o + TILE_W * 3] != cur[o:o + TILE_W * 3]:
-                    lo = tx if lo is None else lo
-                    hi = tx
+                    tiles.add((tx, by))
                     break
-        spans.append((lo, hi))
+    return tiles
+
+
+def tiles_to_rects(tiles, oh):
+    """Merge grid cells into rectangles: per band row the changed column span,
+    consecutive band rows joined (fewer JPEGs = less header overhead)."""
+    spans = {}
+    for tx, ty in tiles:
+        lo, hi = spans.get(ty, (tx, tx))
+        spans[ty] = (min(lo, tx), max(hi, tx))
     rects = []
     run = None
-    for by, sp in enumerate(spans + [None]):
+    for by in range(oh // TILE_H + 1):
+        sp = spans.get(by)
         if sp is None:
             if run:
-                rects.append((run[0] * TILE_W, run[2] * TILE_H, (run[1] + 1) * TILE_W, (by) * TILE_H))
+                rects.append((run[0] * TILE_W, run[2] * TILE_H, (run[1] + 1) * TILE_W, by * TILE_H))
             run = None
         elif run is None:
             run = [sp[0], sp[1], by]
@@ -332,6 +342,10 @@ class Session:
         self.cur_ratio, self.cur_mon = (1.0, 1.0), None
         self.cache_key, self.cache_raw, self.cache_img = None, None, None
         self.ow, self.oh, self.maxjpeg = 320, 240, 48 * 1024
+        self.send_lock = threading.Lock()  # video + audio threads share the socket
+        self.sound_wanted = False
+        self.audio_active = False
+        self.lowq = set()                   # tiles currently shown at motion quality
         # stats for the GUI
         self.connected_at = time.time()
         self.preview = None
@@ -351,19 +365,23 @@ class Session:
         return buf
 
     def send(self, data):
-        self.sock.sendall(data)
-        self._stat_bytes += len(data)
+        with self.send_lock:
+            self.sock.sendall(data)
+            self._stat_bytes += len(data)
 
     def close(self, reason=None):
         if not self.alive:
             return
         self.alive = False
-        if reason is not None:
+        # Goodbye only if the socket is free soon - never hang on a stuck client.
+        if reason is not None and self.send_lock.acquire(timeout=0.5):
             try:
-                self.send(b"X" + bytes([reason]))
+                self.sock.sendall(b"X" + bytes([reason]))
                 self.sock.shutdown(socket.SHUT_WR)  # flush the goodbye before closing
             except OSError:
                 pass
+            finally:
+                self.send_lock.release()
         try:
             self.sock.close()
         except OSError:
@@ -472,6 +490,8 @@ class Session:
             with self.lock:
                 self.force_full = True
             self.wake.set()
+        elif t == ord("U"):
+            self.sound_wanted = bool(p[0])
         elif t == ord("A"):
             with self.lock:
                 self.acked_id = max(self.acked_id, struct.unpack("<I", p)[0])
@@ -580,7 +600,8 @@ class Session:
             log(f"{self.addr[0]}: connected ({self.ow}x{self.oh} panel)")
             threading.Thread(target=self.reader, daemon=True).start()
             prev = None
-            last_send = time.monotonic()
+            last_send = last_change = time.monotonic()
+            last_motion = 0.0
             while self.alive:
                 with self.lock:
                     while self.alive and self.sent_id - self.acked_id >= MAX_INFLIGHT:
@@ -590,6 +611,7 @@ class Session:
                         break
                     if self.force_full:
                         prev = None
+                        self.lowq = set()
                         self.force_full = False
                     q, sub = QUALITY[self.quality]
                 t0 = time.monotonic()
@@ -600,18 +622,39 @@ class Session:
                     time.sleep(0.5)
                     continue
                 cur = frame.tobytes()
-                rects = dirty_rects(prev, cur, self.ow, self.oh)
+                tiles = dirty_tiles(prev, cur, self.ow, self.oh)
+                now = time.monotonic()
+                total = (self.ow // TILE_W) * (self.oh // TILE_H)
+                if tiles:
+                    # Video / scrolling: lots of the screen changes -> cheaper,
+                    # faster-to-decode JPEGs; remember those tiles for a sharp
+                    # re-send once things settle.
+                    motion = prev is not None and (len(tiles) > total * 0.3 or
+                                                   (now - last_motion < 0.5 and len(tiles) > total * 0.08))
+                    if motion:
+                        last_motion = now
+                        enc_q, enc_sub = max(25, q - MOTION_QUALITY_DROP), 2
+                        self.lowq |= tiles
+                    else:
+                        enc_q, enc_sub = q, sub
+                        self.lowq -= tiles
+                    rects = tiles_to_rects(tiles, self.oh)
+                    last_change = now
+                elif self.lowq and now - last_change > REFINE_AFTER:
+                    rects = tiles_to_rects(self.lowq, self.oh)
+                    enc_q, enc_sub = q, sub
+                    self.lowq = set()
+                else:
+                    rects = []
                 try:
                     if rects:
-                        out = []
                         for rect in rects:
-                            for (x0, y0, x1, y1), data in encode_rect(frame, rect, q, sub, self.maxjpeg):
-                                out.append(b"T" + struct.pack("<HHHHI", x0, y0, x1 - x0, y1 - y0, len(data)) + data)
+                            for (x0, y0, x1, y1), data in encode_rect(frame, rect, enc_q, enc_sub, self.maxjpeg):
+                                self.send(b"T" + struct.pack("<HHHHI", x0, y0, x1 - x0, y1 - y0, len(data)) + data)
                         self.sent_id += 1
-                        out.append(b"F" + struct.pack("<IHBBBBB", self.sent_id, min(65535, round(ratio * 100)),
-                                                        zi, zc, self.quality, self.mon_idx % len(monitors) + 1,
-                                                        1 if stretch else 0))
-                        self.send(b"".join(out))
+                        flags = (1 if stretch else 0) | (2 if self.audio_active else 0)
+                        self.send(b"F" + struct.pack("<IHBBBBB", self.sent_id, min(65535, round(ratio * 100)),
+                                                     zi, zc, self.quality, self.mon_idx % len(monitors) + 1, flags))
                         self._stat_frames += 1
                         self.preview = frame
                         prev = cur
@@ -647,6 +690,7 @@ class RemoteServer:
         self.session = None
         self.running = False
         self._tcp = self._udp = None
+        self._audio_thread = None
 
     def remember(self, **kw):
         """Persist settings (also used when the Cardputer toggles stretch).
@@ -679,6 +723,9 @@ class RemoteServer:
         self._tcp, self._udp, self.running = tcp, udp, True
         threading.Thread(target=self._discovery, args=(udp, port), daemon=True).start()
         threading.Thread(target=self._accept, args=(tcp,), daemon=True).start()
+        if self._audio_thread is None:
+            self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+            self._audio_thread.start()
         log(f"listening on port {port}")
 
     def stop(self):
@@ -696,6 +743,43 @@ class RemoteServer:
         if s and s.alive:
             log(f"{s.addr[0]}: disconnected by server")
             s.close(reason=0)
+
+    def _audio_loop(self):
+        """PC sound (WASAPI loopback of the default output) -> the connected
+        Cardputer, as 20 ms blocks of 24 kHz mono mu-law. One thread for the
+        server's lifetime: soundcard sets COM up in the thread that imports it."""
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")  # soundcard warns on every loopback discontinuity
+            import numpy as np
+            import soundcard as sc
+        except Exception as e:
+            log(f"sound unavailable ({e}) - pip install soundcard numpy")
+            return
+        k = 1.0 / np.log1p(255.0)
+        while True:
+            s = self.session
+            if not (s and s.alive and s.sound_wanted and self.cfg["audio"]):
+                time.sleep(0.1)
+                continue
+            try:
+                spk = sc.default_speaker()
+                mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
+                with mic.recorder(samplerate=AUDIO_RATE, channels=1, blocksize=AUDIO_BLOCK) as rec:
+                    s.audio_active = True
+                    log(f"sound: streaming '{spk.name}'")
+                    while s.alive and s.sound_wanted and self.cfg["audio"] and self.session is s:
+                        x = np.clip(rec.record(numframes=AUDIO_BLOCK)[:, 0], -1.0, 1.0)
+                        y = np.sign(x) * np.log1p(255.0 * np.abs(x)) * k
+                        q = np.round((y + 1.0) * 127.5).astype(np.uint8).tobytes()
+                        s.send(b"S" + struct.pack("<H", len(q)) + q)
+            except OSError:
+                pass  # that session's socket closed
+            except Exception as e:
+                log("sound error:", e)
+                time.sleep(2)
+            finally:
+                s.audio_active = False
 
     def _discovery(self, udp, port):
         name = socket.gethostname().encode()[:40]

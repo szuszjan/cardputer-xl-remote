@@ -2,12 +2,19 @@
 
 Remote desktop for the **Cardputer XL**: an [M5Stack Cardputer-ADV](https://docs.m5stack.com/en/core/Cardputer) with an external **ILI9341 320x240** panel on the EXT header (same wiring as [cardputer-xl](https://github.com/szuszjan/cardputer-xl)).
 
-Your PC's screen goes to the big panel, and the Cardputer's keyboard drives your PC. Typing, shortcuts, mouse, zoom and multiple monitors all work.
+Your PC's screen goes to the big panel and **your PC's sound plays on the Cardputer's speaker**. The Cardputer's keyboard drives your PC. Typing, shortcuts, mouse, zoom and multiple monitors all work.
 
 - **External ILI9341**: the PC screen.
 - **Built-in Cardputer screen**: status HUD (KEYBOARD/MOUSE mode, zoom, fps, KB/s, key hints).
 
-The PC does the heavy lifting: it captures the screen, scales it to 320x240, overlays the cursor, finds the regions that changed and JPEG-encodes them. The Cardputer only decodes those small tiles straight onto the panel and sends key events back.
+The PC does the heavy lifting: it captures the screen, scales it to 320x240, overlays the cursor, finds the regions that changed and JPEG-encodes them.
+
+The Cardputer's two cores split the rest:
+- core 0 receives the stream in the background;
+- core 1 decodes tiles with JPEGDEC while the previous block is already going to the panel over SPI DMA;
+- an audio task plays the PC sound from a jitter buffer.
+
+When a lot of the screen moves (video, scrolling), the server sends those tiles at a lower quality. Once the picture holds still, it re-sends them sharp.
 
 ## Quick start
 
@@ -25,6 +32,7 @@ The Cardputer remembers the PC and reconnects to it on the next boot.
 - PIN: copy, generate a new one, hide, or turn PIN off (trusted networks only)
 - Live status: fps, KB/s, zoom level, monitor, connection time
 - **Monitor** picker, **Keep aspect / Stretch to fit**, **quality** (Fast / Normal / Sharp), **max FPS**
+- **Send PC sound** to the Cardputer speaker (WASAPI loopback of the default output, 24 kHz mono)
 - **View only**: show the screen but ignore the Cardputer's keyboard and mouse
 - Disconnect the Cardputer, start/stop the server, log
 
@@ -54,6 +62,8 @@ Windows does not let injected input reach **elevated (admin) windows** unless th
 | Opt + `9` | image quality |
 | Opt + `8` | backlight |
 | Opt + Enter | full refresh |
+| Opt + `[` / `]` | volume down / up |
+| Opt + `\` | sound on / off |
 | Opt + `` ` `` | disconnect (back to the server list) |
 
 **MOUSE mode** controls:
@@ -71,7 +81,7 @@ Windows does not let injected input reach **elevated (admin) windows** unless th
 
 **Firmware** (`CardputerXLRemote.cpp`; the `.ino` is just a stub):
 - Arduino-ESP32 3.x, FQBN `esp32:esp32:m5stack_cardputer`.
-- Libraries: M5Cardputer, Adafruit ILI9341 + GFX, TJpg_Decoder.
+- Libraries: M5Cardputer (its M5GFX also drives the external panel, on SPI2 with DMA), JPEGDEC.
 
 ```bash
 arduino-cli compile --upload -p COM25 --fqbn esp32:esp32:m5stack_cardputer .
@@ -103,8 +113,9 @@ Rebuilding the exe: `pip install pyinstaller`, then run `server/build_exe.bat`. 
 
 ## Protocol & security
 
-Protocol v2 is documented at the top of `server/cxl_remote_server.py`.
+Protocol v3 is documented at the top of `server/cxl_remote_server.py`.
 - Discovery is a UDP broadcast on port 5901; the session runs over TCP 5901.
 - Screen updates are JPEG tiles on a 32x16 grid, merged into rectangles. At most 2 frames are in flight, each acknowledged by the Cardputer.
+- Sound travels on the same connection as 20 ms blocks of 24 kHz mono mu-law.
 - The Cardputer authenticates with an HMAC-SHA256 challenge keyed by the PIN, so the PIN never crosses the network.
 - The screen stream itself is **not encrypted**. Use it on your home network only.
