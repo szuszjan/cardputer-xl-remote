@@ -3,3 +3,4 @@ __pycache__/
 server/build/
 server/dist/
 *.spec
+release/
