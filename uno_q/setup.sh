@@ -26,7 +26,7 @@ apt-get install -y python3-pil python3-numpy python3-xlib python3-cffi python3-v
 
 echo "== python venv ($APP/venv)"
 sudo -u "$USER_NAME" python3 -m venv --system-site-packages "$APP/venv"
-sudo -u "$USER_NAME" "$APP/venv/bin/pip" install --quiet --upgrade mss soundcard
+sudo -u "$USER_NAME" "$APP/venv/bin/pip" install --quiet --upgrade mss soundcard msgpack
 
 echo "== virtual screen $RES"
 case "$RES" in
