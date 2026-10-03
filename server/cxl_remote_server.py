@@ -46,7 +46,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -754,6 +754,157 @@ class Session:
 
 
 # ---------------------------------------------------------------------------
+# Arduino UNO Q: 13x8 LED matrix (uno_q/matrix_mcu sketch on the MCU side).
+# Frames are composed here and sent through the arduino-router as one
+# msgpack-RPC call per frame. Idle: the PIN scrolls by. Connected: a clock,
+# switching to a sound spectrum while the PC's audio is actually playing.
+# ---------------------------------------------------------------------------
+ROUTER_SOCK = "/run/arduino-router.sock"
+MX_W, MX_H = 13, 8
+
+FONT5x7 = {  # 5 columns x 7 rows, bit 4 = leftmost column
+    "0": (14, 17, 19, 21, 25, 17, 14), "1": (4, 12, 4, 4, 4, 4, 14), "2": (14, 17, 1, 2, 4, 8, 31),
+    "3": (31, 2, 4, 2, 1, 17, 14), "4": (2, 6, 10, 18, 31, 2, 2), "5": (31, 16, 30, 1, 1, 17, 14),
+    "6": (6, 8, 16, 30, 17, 17, 14), "7": (31, 1, 2, 4, 8, 8, 8), "8": (14, 17, 17, 14, 17, 17, 14),
+    "9": (14, 17, 17, 15, 1, 2, 12), "P": (30, 17, 17, 30, 16, 16, 16), "I": (14, 4, 4, 4, 4, 4, 14),
+    "N": (17, 25, 21, 19, 17, 17, 17), " ": (0, 0, 0, 0, 0, 0, 0),
+}
+FONT3x5 = {  # 3 columns x 5 rows, bit 2 = leftmost column
+    "0": (7, 5, 5, 5, 7), "1": (2, 6, 2, 2, 7), "2": (7, 1, 7, 4, 7), "3": (7, 1, 7, 1, 7),
+    "4": (5, 5, 7, 1, 1), "5": (7, 4, 7, 1, 7), "6": (7, 4, 7, 5, 7), "7": (7, 1, 2, 2, 2),
+    "8": (7, 5, 7, 5, 7), "9": (7, 5, 7, 1, 7),
+}
+
+
+class LedMatrix:
+    def __init__(self, server):
+        self.server = server
+        self.sock = None
+        self.msgid = 0
+        self.last_frame = None
+        self.bands = [0.0] * MX_W     # bar heights 0..8, fed by the audio thread
+        self.peak = 1e-3              # slow auto-gain for the spectrum
+        self.last_loud = 0.0
+        self.np = None
+
+    @staticmethod
+    def available():
+        return sys.platform.startswith("linux") and os.path.exists(ROUTER_SOCK)
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    # -- audio in (called from the server's audio thread, 20 ms blocks) --
+    def feed_audio(self, np, x):
+        self.np = np
+        if float(np.sqrt(np.mean(x * x))) < 0.003:
+            return
+        self.last_loud = time.monotonic()
+        mag = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+        edges = np.geomspace(2, len(mag) - 1, MX_W + 1).astype(int)  # ~100 Hz .. 12 kHz, log-spaced
+        e = np.array([mag[a:max(a + 1, b)].mean() for a, b in zip(edges[:-1], edges[1:])])
+        self.peak = max(self.peak * 0.995, float(e.max()))
+        levels = np.clip(np.log1p(e / self.peak * 30) / np.log1p(30) * MX_H, 0, MX_H)
+        self.bands = [max(float(l), b - 0.6) for l, b in zip(levels, self.bands)]  # fast rise, slow fall
+
+    # -- frames --
+    def _text_frame(self, text, offset):
+        cols = []
+        for ch in text:
+            g = FONT5x7.get(ch, FONT5x7[" "])
+            for c in range(5):
+                cols.append([(g[r] >> (4 - c)) & 1 for r in range(7)])
+            cols.append([0] * 7)
+        f = bytearray(MX_W * MX_H)
+        n = len(cols)
+        for x in range(MX_W):
+            col = cols[(x + offset) % n]
+            for r in range(7):
+                if col[r]:
+                    f[(r + 1) * MX_W + x] = 7
+        return bytes(f)
+
+    def _clock_frame(self):
+        t = time.localtime()
+        digits = f"{t.tm_hour:02d}{t.tm_min:02d}"
+        f = bytearray(MX_W * MX_H)
+        # 3+3 | colon | 3+3 = 13 columns, no gaps: tens bright, ones dimmer.
+        for i, (d, x0) in enumerate(zip(digits, (0, 3, 7, 10))):
+            g, lvl = FONT3x5[d], (7 if i % 2 == 0 else 3)
+            for r in range(5):
+                for c in range(3):
+                    if (g[r] >> (2 - c)) & 1:
+                        f[(r + 1) * MX_W + x0 + c] = lvl
+        if t.tm_sec % 2 == 0:
+            f[2 * MX_W + 6] = f[4 * MX_W + 6] = 5
+        return bytes(f)
+
+    def _spectrum_frame(self):
+        f = bytearray(MX_W * MX_H)
+        for x, h in enumerate(self.bands):
+            top = int(round(h))
+            for k in range(top):
+                f[(MX_H - 1 - k) * MX_W + x] = 7 if k == top - 1 else 3
+        self.bands = [max(0.0, b - 0.3) for b in self.bands]
+        return bytes(f)
+
+    # -- router --
+    def _send(self, frame):
+        import msgpack
+        if self.sock is None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(ROUTER_SOCK)
+            threading.Thread(target=self._drain, args=(self.sock,), daemon=True).start()
+        self.msgid = (self.msgid + 1) & 0x7FFFFFFF
+        self.sock.sendall(msgpack.packb([0, self.msgid, "cxl_frame", [frame]], use_bin_type=True))
+
+    def _drain(self, sock):
+        import msgpack
+        unpacker = msgpack.Unpacker(raw=False)
+        warned = False
+        try:
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                unpacker.feed(data)
+                for msg in unpacker:
+                    if isinstance(msg, list) and len(msg) == 4 and msg[0] == 1 and msg[2] and not warned:
+                        log(f"LED matrix: {msg[2]} (is uno_q/matrix_mcu flashed on the MCU?)")
+                        warned = True
+        except OSError:
+            pass
+
+    def _loop(self):
+        offset = 0
+        tick = 0
+        while True:
+            try:
+                s = self.server.session
+                if not (s and s.alive):
+                    cfg = self.server.cfg
+                    frame = self._text_frame(f"PIN {cfg['pin']}  " if cfg["require_pin"] else " ", offset)
+                    tick += 1
+                    if tick % 2 == 0:
+                        offset += 1
+                elif time.monotonic() - self.last_loud < 2.0:
+                    frame = self._spectrum_frame()
+                else:
+                    frame = self._clock_frame()
+                if frame != self.last_frame:
+                    self._send(frame)
+                    self.last_frame = frame
+            except OSError as e:
+                log("LED matrix: router unavailable -", e)
+                self.sock, self.last_frame = None, None
+                time.sleep(10)
+            except Exception as e:
+                log("LED matrix error:", e)
+                time.sleep(5)
+            time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
 # Server: discovery + accept loop, shared by the console and GUI front-ends
 # ---------------------------------------------------------------------------
 class RemoteServer:
@@ -767,6 +918,8 @@ class RemoteServer:
         self.running = False
         self._tcp = self._udp = None
         self._audio_thread = None
+        self.matrix = LedMatrix(self) if LedMatrix.available() else None
+        self._matrix_started = False
 
     def remember(self, **kw):
         """Persist settings (also used when the Cardputer toggles stretch).
@@ -802,6 +955,9 @@ class RemoteServer:
         if self._audio_thread is None:
             self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
             self._audio_thread.start()
+        if self.matrix and not self._matrix_started:
+            self.matrix.start()
+            self._matrix_started = True
         log(f"listening on port {port}")
 
     def stop(self):
@@ -846,6 +1002,8 @@ class RemoteServer:
                     log(f"sound: streaming '{spk.name}'")
                     while s.alive and s.sound_wanted and self.cfg["audio"] and self.session is s:
                         x = np.clip(rec.record(numframes=AUDIO_BLOCK)[:, 0], -1.0, 1.0)
+                        if self.matrix:
+                            self.matrix.feed_audio(np, x)
                         y = np.sign(x) * np.log1p(255.0 * np.abs(x)) * k
                         q = np.round((y + 1.0) * 127.5).astype(np.uint8).tobytes()
                         s.send(b"S" + struct.pack("<H", len(q)) + q)
