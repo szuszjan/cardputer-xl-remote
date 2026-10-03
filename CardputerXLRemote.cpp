@@ -81,7 +81,7 @@
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
 constexpr uint8_t PROTO_VER = 3;
-#define CXL_REMOTE_VERSION "1.2.0"
+#define CXL_REMOTE_VERSION "1.2.1"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
@@ -372,7 +372,33 @@ void drawHud() {
   hud.pushSprite(0, 0);
 }
 
+// Hotspot mode keeps the radio on the AP's channel: the stock auto-reconnect
+// would rescan every channel back to back whenever the main Wi-Fi drops,
+// starving the hotspot (100 ms+ stalls, ~0 fps). Instead: one targeted retry
+// (known channel + BSSID, no scan) every 30 s, a full one every 60 s when the
+// main network was never seen. NAT is (re)enabled as soon as it's up.
+uint32_t staRetryAt = 0;
+bool staWasUp = false, staKnown = false;
+uint8_t staChannel = 0, staBssid[6];
+void serviceWifi() {
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up && !staWasUp) {
+    staChannel = WiFi.channel();
+    memcpy(staBssid, WiFi.BSSID(), 6);
+    staKnown = true;
+    if (hotspotOn) WiFi.AP.enableNAPT(true);
+    hudDirty = true;
+  }
+  if (!up && staWasUp) { staRetryAt = millis() + 5000; hudDirty = true; }
+  staWasUp = up;
+  if (!hotspotOn || up || wifiSsid.isEmpty() || (int32_t)(millis() - staRetryAt) < 0) return;
+  if (staKnown) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), staChannel, staBssid);
+  else WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  staRetryAt = millis() + (staKnown ? 30000 : 60000);
+}
+
 void serviceHud(bool force = false) {
+  serviceWifi();
   uint32_t now = millis();
   if (force || (hudDirty && now - hudLastDraw > 120) || now - hudLastDraw > 1000) {
     drawHud();
@@ -505,7 +531,10 @@ void startHotspot() {
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0), IPAddress(192, 168, 77, 10), dns);
   // The AP follows the main network's channel once the station is connected.
   WiFi.softAP(apSsid.c_str(), apPass.c_str(), 1, 0, 4);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
   WiFi.AP.enableNAPT(WiFi.status() == WL_CONNECTED);
+  staRetryAt = millis() + 30000;
   udp.begin(DISCOVERY_LOCAL_PORT);
 }
 
@@ -513,6 +542,9 @@ void stopHotspot() {
   WiFi.AP.enableNAPT(false);
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  if (WiFi.status() != WL_CONNECTED && !wifiSsid.isEmpty()) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
 }
 
 bool connectWifi() {
@@ -525,7 +557,7 @@ bool connectWifi() {
   setStatus("Wi-Fi...", wifiSsid);
   WiFi.mode(hotspotOn ? WIFI_AP_STA : WIFI_STA);
   WiFi.persistent(false);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(!hotspotOn);  // hotspot mode retries itself, see serviceWifi()
   WiFi.setSleep(false);  // modem sleep adds ~100 ms of input latency
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   uint32_t t0 = millis();
