@@ -27,6 +27,7 @@ Protocol v3 (little-endian):
         'W' v:i8 h:i8       'Z' zoom:i8 (+1 in, -1 out, 0 fit; 0 at fit toggles stretch)
         'Q' quality         'N' next monitor    'R' full refresh   'U' want sound:u8
         'C' show cursor:u8 (0 hides the pointer overlay)
+        'L' fps cap:u8 (0 = unlimited - the frame acks pace it, 255 = server setting)
         'A' frame ack id:u32   'P' ping
 """
 
@@ -45,7 +46,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -409,6 +410,7 @@ class Session:
         self.sound_wanted = False
         self.audio_active = False
         self.lowq = set()                   # tiles currently shown at motion quality
+        self.fps_cap = 255                  # 'L' from the Cardputer; 255 = use cfg["fps"]
         # stats for the GUI
         self.connected_at = time.time()
         self.preview = None
@@ -552,6 +554,9 @@ class Session:
         elif t == ord("R"):
             with self.lock:
                 self.force_full = True
+            self.wake.set()
+        elif t == ord("L"):
+            self.fps_cap = p[0]
             self.wake.set()
         elif t == ord("C"):
             self.server.remember(cursor=bool(p[0]))
@@ -741,7 +746,8 @@ class Session:
                     self._stat_frames = self._stat_bytes = 0
                     self._stat_t0 = now
                 # pace: at most cfg fps, but wake early on input so the pointer feels live
-                min_dt = 1.0 / max(1, self.server.cfg["fps"])
+                cap = self.server.cfg["fps"] if self.fps_cap == 255 else self.fps_cap
+                min_dt = 1.0 / cap if cap > 0 else 0.0
                 self.wake.wait(max(0.0, (min_dt if rects else 0.04) - (now - t0)))
                 self.wake.clear()
         self.close()

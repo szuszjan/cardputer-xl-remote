@@ -43,6 +43,7 @@
 //   Opt + Enter  full refresh                Opt + `  disconnect
 //   Opt + [ / ]  volume down / up            Opt + \  sound on/off
 //   Opt + 7  show / hide the mouse cursor
+//   Opt + 6  frame-rate cap: MAX (none) / 30 / 20 / 15 / SRV (server's own)
 //
 // HOTSPOT ("proxy") MODE - picker menu: the Cardputer stays on the main
 // Wi-Fi AND runs its own access point (192.168.77.1/24) for the server, e.g.
@@ -81,7 +82,7 @@
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
 constexpr uint8_t PROTO_VER = 3;
-#define CXL_REMOTE_VERSION "1.2.1"
+#define CXL_REMOTE_VERSION "1.2.2"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
@@ -181,6 +182,10 @@ uint8_t rotation = 3, brightness = 10, quality = 1, volume = 128;
 bool soundOn = true, hotspotOn = false;
 String apSsid, apPass;
 const char* qualityNames[] = {"FAST", "NORMAL", "SHARP"};
+// Frame-rate cap sent to the server ('L'): 0 = none, 255 = the server's setting.
+const uint8_t fpsCaps[] = {0, 30, 20, 15, 255};
+const char* fpsCapNames[] = {"MAX", "30", "20", "15", "SRV"};
+uint8_t fpsCapIdx = 0;
 
 // ---- Session / HUD state ----
 String serverName, statusLine = "Starting", statusLine2;
@@ -213,6 +218,7 @@ void saveSettings() {
   prefs.putUShort("srv_port", lastServerPort);
   prefs.putUChar("bright", brightness);
   prefs.putUChar("quality", quality);
+  prefs.putUChar("fpscap", fpsCapIdx);
   prefs.putUChar("volume", volume);
   prefs.putBool("sound", soundOn);
   prefs.putBool("hotspot", hotspotOn);
@@ -231,6 +237,7 @@ void loadSettings() {
     lastServerPort = prefs.getUShort("srv_port", REMOTE_PORT);
     savedBright = prefs.getUChar("bright", 0);
     quality = min<uint8_t>(prefs.getUChar("quality", 1), 2);
+    fpsCapIdx = min<uint8_t>(prefs.getUChar("fpscap", 0), 4);
     volume = prefs.getUChar("volume", volume);
     soundOn = prefs.getBool("sound", soundOn);
     hotspotOn = prefs.getBool("hotspot", false);
@@ -352,7 +359,7 @@ void drawHud() {
 
   hud.setTextColor((uint16_t)TFT_LIGHTGREY);
   hud.setCursor(4, 61);
-  hud.printf("%4.1f fps  %4.0f KB/s  Q:%s", fps, kbps, qualityNames[quality]);
+  hud.printf("%4.1f/%s fps %4.0fKB/s Q:%s", fps, fpsCapNames[fpsCapIdx], kbps, qualityNames[quality]);
   hud.setCursor(4, 72); hud.setTextColor((uint16_t)0x8C71);
   String snd = !soundOn ? String("MUTE") : (audioStreaming ? "VOL " + String(volume * 100 / 255) + "%" : String("no audio"));
   hud.print((snd + "  key: " + lastKeyLabel).substring(0, 39));
@@ -361,7 +368,7 @@ void drawHud() {
   const char* const* lines;
   static const char* keyHints[] = {"Fn+;.,/ arrows  Fn+` Esc  Fn+1-= F1-12",
                                    "Fn+Del Del Fn+[] PgUp/Dn Opt+[]\\ sound",
-                                   "Opt=Win Opt+Spc/G0 mouse Opt+-= zoom",
+                                   "Opt=Win Opt+Spc/G0 mouse Opt+6 fps cap",
                                    "Opt+0 fit Opt+7 cursor Opt+9 q Opt+` quit"};
   static const char* mouseHints[] = {";.,/ move (Shift slow)  Ent/Spc left",
                                      "\\ right  ' middle  [ ] wheel  hold=drag",
@@ -731,6 +738,7 @@ void sendWheel(int8_t v, int8_t h) { uint8_t p[2] = {(uint8_t)v, (uint8_t)h}; se
 void sendMove(int16_t dx8, int16_t dy8) { uint8_t p[4] = {(uint8_t)dx8, (uint8_t)(dx8 >> 8), (uint8_t)dy8, (uint8_t)(dy8 >> 8)}; sendMsg('M', p, 4); }
 void sendZoom(int8_t z) { uint8_t p[1] = {(uint8_t)z}; sendMsg('Z', p, 1); }
 void sendQuality() { uint8_t p[1] = {quality}; sendMsg('Q', p, 1); }
+void sendFpsCap() { uint8_t p[1] = {fpsCaps[fpsCapIdx]}; sendMsg('L', p, 1); }
 
 // ============================================================================
 // Session: keyboard -> actions. Each physical key remembers what its press
@@ -791,6 +799,7 @@ bool optCommand(uint8_t c) {
     case '9': quality = (quality + 1) % 3; sendQuality(); saveSettings(); hudDirty = true; haptic(); return true;
     case '8': cycleBrightness(); haptic(); return true;
     case '7': { uint8_t show = !cursorShown; sendMsg('C', &show, 1); haptic(); return true; }
+    case '6': fpsCapIdx = (fpsCapIdx + 1) % 5; sendFpsCap(); saveSettings(); hudDirty = true; haptic(); return true;
     case KEY_ENTER: sendMsg('R', nullptr, 0); haptic(); return true;
     case '[': case ']':
       volume = c == '[' ? (volume > 16 ? volume - 16 : 0) : min(255, volume + 16);
@@ -1127,6 +1136,7 @@ void runSession() {
   startAudio();
 
   sendQuality();
+  sendFpsCap();
   sendSoundWanted();
   hudDirty = true;
   haptic(40);
