@@ -83,7 +83,7 @@
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
 constexpr uint8_t PROTO_VER = 3;
-#define CXL_REMOTE_VERSION "1.3.0"
+#define CXL_REMOTE_VERSION "1.3.1"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
@@ -353,7 +353,24 @@ void drawHud() {
   }
 
   hud.setTextColor((uint16_t)TFT_LIGHTGREY);
-  hud.setCursor(4, 19); hud.print((serverName + "  " + String(serverScreenW) + "x" + String(serverScreenH)).substring(0, 39));
+  hud.setCursor(4, 19); hud.print((serverName + "  " + String(serverScreenW) + "x" + String(serverScreenH)).substring(0, 30));
+  // Hottest CPU zone (or hottest zone at all), always visible next to the resolution.
+  {
+    uint8_t n = tempCount;
+    int best = -1, bestAny = -1;
+    for (int i = 0; i < n && i < MAX_TEMPS; ++i) {
+      if (bestAny < 0 || tempX10[i] > tempX10[bestAny]) bestAny = i;
+      if (!strncmp(tempNames[i], "CPU", 3) && (best < 0 || tempX10[i] > tempX10[best])) best = i;
+    }
+    if (best < 0) best = bestAny;
+    if (best >= 0 && millis() - tempsAt < 6000) {
+      float t = tempX10[best] / 10.0f;
+      uint16_t c = t < 60 ? (uint16_t)0x07E0 : t < 75 ? (uint16_t)0xFFE0 : t < 90 ? (uint16_t)0xFD20 : (uint16_t)0xF800;
+      hud.setTextColor(c);
+      hud.setCursor(190, 19); hud.printf("CPU%3.0fC", t);
+      hud.setTextColor((uint16_t)TFT_LIGHTGREY);
+    }
+  }
 
   uint16_t badge = mouseMode ? (uint16_t)0xFC60 : (uint16_t)0x2589;
   hud.fillRoundRect(4, 31, 120, 24, 4, badge);

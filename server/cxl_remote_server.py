@@ -48,7 +48,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -565,6 +565,7 @@ class Session:
             self.wake.set()
         elif t == ord("G"):
             self.want_temps = bool(p[0])
+            log(f"{self.addr[0]}: temperatures {'requested' if self.want_temps else 'off'}")
         elif t == ord("L"):
             self.fps_cap = p[0]
             self.wake.set()
@@ -756,6 +757,9 @@ class Session:
                 if self.want_temps and now - self._temps_at >= 2.0:
                     self._temps_at = now
                     temps = read_temperatures()
+                    if not temps and not getattr(self, "_temps_warned", False):
+                        log("temperatures: no thermal zones readable")
+                        self._temps_warned = True
                     if temps:
                         msg = bytearray(b"M") + bytes([len(temps)])
                         for name, celsius in temps:
