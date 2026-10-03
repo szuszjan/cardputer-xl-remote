@@ -46,7 +46,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -791,19 +791,25 @@ class LedMatrix:
         self.peak = 1e-3              # slow auto-gain for the spectrum
         self.last_loud = 0.0
         self.np = None
-        self.searching_until = 0.0    # Cardputer discovery pings / TCP connect in progress
+        self.searching_until = 0.0    # a Cardputer is connecting (TCP accepted, handshake running)
+        self.connect_started = 0.0
         self.event_kind, self.event_at = None, 0.0   # "connected" / "failed" one-shot animations
         self.tz_checked = 0.0
 
     def event(self, kind):
-        """Hooks from the server: 'search' (discovery ping or connect started),
-        'connected' (handshake ok), 'failed' (wrong PIN)."""
+        """Hooks from the server: 'connecting' (TCP accepted), then 'connected'
+        (handshake ok) or 'failed' (wrong PIN). The ripple always runs for at
+        least a second before the tick / X, otherwise a fast LAN handshake
+        would make it invisible."""
         now = time.monotonic()
-        if kind == "search":
-            self.searching_until = now + 3.0
+        if kind == "connecting":
+            self.connect_started = now
+            self.searching_until = now + 5.0
+            self.event_kind = None
         else:
-            self.searching_until = 0.0
-            self.event_kind, self.event_at = kind, now
+            self.event_kind = kind
+            self.event_at = max(now, self.connect_started + 1.0)
+            self.searching_until = self.event_at
 
     @staticmethod
     def available():
@@ -931,9 +937,9 @@ class LedMatrix:
                 now = time.monotonic()
                 s = self.server.session
                 ready = bool(s and s.alive and getattr(s, "ready", False))
-                if self.event_kind and now - self.event_at < 1.6:
+                if self.event_kind and 0 <= now - self.event_at < 1.6:
                     new_mode, frame = "event", self._event_frame(now - self.event_at)
-                elif now < self.searching_until and not ready:
+                elif now < self.searching_until:
                     new_mode, frame = "search", self._ripple_frame(now)
                 elif ready and now - self.last_loud < 2.0:
                     new_mode, frame = "spectrum", self._spectrum_frame()
@@ -1080,8 +1086,6 @@ class RemoteServer:
             try:
                 data, addr = udp.recvfrom(64)
                 if data.startswith(b"CXLR?"):
-                    if self.matrix:
-                        self.matrix.event("search")
                     udp.sendto(b"CXLR!" + struct.pack("<H", port) + name, addr)
             except OSError:
                 if not self.running:
@@ -1100,7 +1104,7 @@ class RemoteServer:
                 log(f"{old.addr[0]}: replaced by {addr[0]}")
                 old.close(reason=2)
             if self.matrix:
-                self.matrix.event("search")
+                self.matrix.event("connecting")
             sess = Session(sock, addr, self)
             self.session = sess
             threading.Thread(target=self._run_session, args=(sess,), daemon=True).start()
