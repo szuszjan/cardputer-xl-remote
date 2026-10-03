@@ -17,4 +17,7 @@ if pactl info >/dev/null 2>&1; then
   pactl set-default-sink cxl_out
 fi
 
+# Back onto the Cardputer's hotspot whenever it reappears (see the script).
+pgrep -f "[h]otspot_watch.sh" >/dev/null || (setsid ./hotspot_watch.sh >/dev/null 2>&1 &)
+
 exec ./venv/bin/python cxl_remote_server.py --fps 20 >> server.log 2>&1
