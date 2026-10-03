@@ -201,7 +201,68 @@ if sys.platform == "win32":
     def make_input():
         return WinInput()
 else:
+    class X11Input:
+        """Linux/X11 (e.g. Arduino UNO Q's XFCE session) via the XTEST
+        extension. One X connection shared by the reader and render threads,
+        so every call takes the lock."""
+        KEYSYMS = {
+            "backspace": "BackSpace", "tab": "Tab", "enter": "Return", "shift": "Shift_L",
+            "ctrl": "Control_L", "alt": "Alt_L", "esc": "Escape", "space": "space",
+            "page_up": "Prior", "page_down": "Next", "end": "End", "home": "Home",
+            "left": "Left", "up": "Up", "right": "Right", "down": "Down", "print_screen": "Print",
+            "insert": "Insert", "delete": "Delete", "cmd": "Super_L", "menu": "Menu",
+            **{f"f{i}": f"F{i}" for i in range(1, 13)},
+        }
+        BUTTONS = (1, 3, 2)  # left, right, middle
+
+        def __init__(self):
+            from Xlib import X, XK, display
+            from Xlib.ext import xtest
+            self.X, self.XK, self.xtest = X, XK, xtest
+            self.d = display.Display()
+            self.root = self.d.screen().root
+            self.lock = threading.Lock()
+
+        def _fake(self, *args, **kw):
+            self.xtest.fake_input(self.d, *args, **kw)
+            self.d.sync()
+
+        def key(self, name, down):
+            # Single characters are the Cardputer's unshifted key caps; ASCII
+            # keysyms equal their code points, and Shift arrives as its own key.
+            sym = ord(name) if len(name) == 1 else self.XK.string_to_keysym(self.KEYSYMS.get(name, ""))
+            with self.lock:
+                code = self.d.keysym_to_keycode(sym) if sym else 0
+                if code:
+                    self._fake(self.X.KeyPress if down else self.X.KeyRelease, code)
+
+        def cursor_pos(self):
+            with self.lock:
+                p = self.root.query_pointer()
+                return p.root_x, p.root_y
+
+        def set_cursor(self, x, y):
+            with self.lock:
+                self._fake(self.X.MotionNotify, x=int(x), y=int(y))
+
+        def button(self, b, down):
+            if 0 <= b < 3:
+                with self.lock:
+                    self._fake(self.X.ButtonPress if down else self.X.ButtonRelease, self.BUTTONS[b])
+
+        def wheel(self, v, h):
+            with self.lock:
+                for btn, n in ((4 if v > 0 else 5, abs(v)), (7 if h > 0 else 6, abs(h))):
+                    for _ in range(n):
+                        self._fake(self.X.ButtonPress, btn)
+                        self._fake(self.X.ButtonRelease, btn)
+
     def make_input():
+        if os.environ.get("DISPLAY"):
+            try:
+                return X11Input()
+            except ImportError:
+                pass  # python3-xlib missing: fall back to pynput
         from pynput import keyboard, mouse
 
         class PynputInput:
