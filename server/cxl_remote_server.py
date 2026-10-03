@@ -20,6 +20,7 @@ Protocol v3 (little-endian):
         'F' id:u32 ratio_x100:u16 zoom_idx zoom_count quality monitor flags (u8 each)
             flags bit0 = stretch-to-fit active, bit1 = sound streaming, bit2 = cursor hidden
         'S' len:u16 audio                 24 kHz mono, continuous mu-law (mu=255) bytes
+        'M' count:u8 {namelen:u8 name temp_x10:i16}*count   temperatures, every 2 s once asked
         'H'                               heartbeat
         'X' reason:u8                     goodbye (2 = replaced by another client)
   C->S  [type:u8][len:u8][payload]
@@ -28,6 +29,7 @@ Protocol v3 (little-endian):
         'Q' quality         'N' next monitor    'R' full refresh   'U' want sound:u8
         'C' show cursor:u8 (0 hides the pointer overlay)
         'L' fps cap:u8 (0 = unlimited - the frame acks pace it, 255 = server setting)
+        'G' want temperatures:u8 (opt-in, so older firmware never sees 'M')
         'A' frame ack id:u32   'P' ping
 """
 
@@ -46,7 +48,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -411,6 +413,8 @@ class Session:
         self.audio_active = False
         self.lowq = set()                   # tiles currently shown at motion quality
         self.fps_cap = 255                  # 'L' from the Cardputer; 255 = use cfg["fps"]
+        self.want_temps = False             # 'G' from the Cardputer
+        self._temps_at = 0.0
         # stats for the GUI
         self.connected_at = time.time()
         self.preview = None
@@ -559,6 +563,8 @@ class Session:
             with self.lock:
                 self.force_full = True
             self.wake.set()
+        elif t == ord("G"):
+            self.want_temps = bool(p[0])
         elif t == ord("L"):
             self.fps_cap = p[0]
             self.wake.set()
@@ -747,6 +753,18 @@ class Session:
                 except OSError:
                     break
                 now = time.monotonic()
+                if self.want_temps and now - self._temps_at >= 2.0:
+                    self._temps_at = now
+                    temps = read_temperatures()
+                    if temps:
+                        msg = bytearray(b"M") + bytes([len(temps)])
+                        for name, celsius in temps:
+                            n = name.encode()[:12]
+                            msg += bytes([len(n)]) + n + struct.pack("<h", int(round(celsius * 10)))
+                        try:
+                            self.send(bytes(msg))
+                        except OSError:
+                            break
                 if now - self._stat_t0 >= 1:
                     self.fps = self._stat_frames / (now - self._stat_t0)
                     self.kbps = self._stat_bytes / 1024 / (now - self._stat_t0)
@@ -1136,6 +1154,35 @@ class RemoteServer:
         except (OSError, ConnectionError, struct.error) as e:
             log(f"{s.addr[0]}: {e}")
             s.close()
+
+
+THERMAL_LABELS = {"cpuss0": "CPU0", "cpuss1": "CPU1", "hm-center": "BOARD", "camera": "CAM",
+                  "video": "VIDEO", "mapss": "MAPSS", "wlan": "WLAN", "gpu": "GPU"}
+
+
+def read_temperatures():
+    """All Linux thermal zones as (short label, deg C), at most 12. Empty on
+    systems without /sys/class/thermal (e.g. Windows)."""
+    out = []
+    try:
+        zones = sorted(os.listdir("/sys/class/thermal"))
+    except OSError:
+        return out
+    for z in zones:
+        if not z.startswith("thermal_zone"):
+            continue
+        try:
+            with open(f"/sys/class/thermal/{z}/type") as f:
+                kind = f.read().strip()
+            with open(f"/sys/class/thermal/{z}/temp") as f:
+                milli = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        base = kind[:-8] if kind.endswith("-thermal") else kind
+        out.append((THERMAL_LABELS.get(base, base.upper())[:5], milli / 1000.0))
+    # CPU first, then the rest as the kernel lists them
+    out.sort(key=lambda t: (not t[0].startswith("CPU"), t[0] if t[0].startswith("CPU") else ""))
+    return out[:12]
 
 
 def local_ips():

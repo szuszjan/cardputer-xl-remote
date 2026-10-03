@@ -44,6 +44,7 @@
 //   Opt + [ / ]  volume down / up            Opt + \  sound on/off
 //   Opt + 7  show / hide the mouse cursor
 //   Opt + 6  frame-rate cap: MAX (none) / 30 / 20 / 15 / SRV (server's own)
+//   Opt + 5  small screen: key hints <-> the server's temperature gauges
 //
 // HOTSPOT ("proxy") MODE - picker menu: the Cardputer stays on the main
 // Wi-Fi AND runs its own access point (192.168.77.1/24) for the server, e.g.
@@ -82,7 +83,7 @@
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
 constexpr uint8_t PROTO_VER = 3;
-#define CXL_REMOTE_VERSION "1.2.2"
+#define CXL_REMOTE_VERSION "1.3.0"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
@@ -186,6 +187,13 @@ const char* qualityNames[] = {"FAST", "NORMAL", "SHARP"};
 const uint8_t fpsCaps[] = {0, 30, 20, 15, 255};
 const char* fpsCapNames[] = {"MAX", "30", "20", "15", "SRV"};
 uint8_t fpsCapIdx = 0;
+// Server temperatures ('M', every 2 s), written by rxTask, drawn by drawHud().
+constexpr int MAX_TEMPS = 12;
+char tempNames[MAX_TEMPS][13];
+int16_t tempX10[MAX_TEMPS];
+volatile uint8_t tempCount = 0;
+volatile uint32_t tempsAt = 0;
+uint8_t hudPage = 0;  // 0 = key hints, 1 = temperature gauges
 
 // ---- Session / HUD state ----
 String serverName, statusLine = "Starting", statusLine2;
@@ -219,6 +227,7 @@ void saveSettings() {
   prefs.putUChar("bright", brightness);
   prefs.putUChar("quality", quality);
   prefs.putUChar("fpscap", fpsCapIdx);
+  prefs.putUChar("hudpage", hudPage);
   prefs.putUChar("volume", volume);
   prefs.putBool("sound", soundOn);
   prefs.putBool("hotspot", hotspotOn);
@@ -238,6 +247,7 @@ void loadSettings() {
     savedBright = prefs.getUChar("bright", 0);
     quality = min<uint8_t>(prefs.getUChar("quality", 1), 2);
     fpsCapIdx = min<uint8_t>(prefs.getUChar("fpscap", 0), 4);
+    hudPage = min<uint8_t>(prefs.getUChar("hudpage", 0), 1);
     volume = prefs.getUChar("volume", volume);
     soundOn = prefs.getBool("sound", soundOn);
     hotspotOn = prefs.getBool("hotspot", false);
@@ -310,6 +320,7 @@ UiKey uiPoll() {
 // ============================================================================
 void setStatus(const String& a, const String& b = "") { statusLine = a; statusLine2 = b; hudDirty = true; }
 
+void drawTempGauges();
 void drawHud() {
   hud.fillScreen((uint16_t)TFT_BLACK);
   hud.fillRect(0, 0, 240, 14, (uint16_t)0x0233);
@@ -368,14 +379,18 @@ void drawHud() {
   const char* const* lines;
   static const char* keyHints[] = {"Fn+;.,/ arrows  Fn+` Esc  Fn+1-= F1-12",
                                    "Fn+Del Del Fn+[] PgUp/Dn Opt+[]\\ sound",
-                                   "Opt=Win Opt+Spc/G0 mouse Opt+6 fps cap",
+                                   "Opt+Spc/G0 mouse Opt+6 fps Opt+5 temps",
                                    "Opt+0 fit Opt+7 cursor Opt+9 q Opt+` quit"};
   static const char* mouseHints[] = {";.,/ move (Shift slow)  Ent/Spc left",
                                      "\\ right  ' middle  [ ] wheel  hold=drag",
                                      "Opt+Spc/G0 keybd  Opt+-= zoom  Opt+0 fit",
                                      "other keys still type  Opt+` quit"};
   lines = mouseMode ? mouseHints : keyHints;
-  for (int i = 0; i < 4; ++i) { hud.setCursor(2, 87 + i * 12); hud.print(lines[i]); }
+  if (hudPage == 1) {
+    drawTempGauges();
+  } else {
+    for (int i = 0; i < 4; ++i) { hud.setCursor(2, 87 + i * 12); hud.print(lines[i]); }
+  }
   hud.pushSprite(0, 0);
 }
 
@@ -402,6 +417,32 @@ void serviceWifi() {
   if (staKnown) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), staChannel, staBssid);
   else WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   staRetryAt = millis() + (staKnown ? 30000 : 60000);
+}
+
+// Two columns x 6 rows of mini gauges: label, bar 30..95 C (the UNO Q's CPU
+// starts throttling at 90 C), value.
+void drawTempGauges() {
+  uint8_t n = tempCount;
+  if (!n || millis() - tempsAt > 6000) {
+    hud.setTextColor((uint16_t)0x8C71);
+    hud.setCursor(4, 100); hud.print(n ? "temperatures: no update" : "no temperature sensors on this PC");
+    hud.setCursor(4, 112); hud.print("Opt+5: back to key hints");
+    return;
+  }
+  for (int i = 0; i < n && i < MAX_TEMPS; ++i) {
+    int col = i / 6, row = i % 6;
+    int x = 2 + col * 120, y = 86 + row * 8;
+    float t = tempX10[i] / 10.0f;
+    uint16_t c = t < 60 ? (uint16_t)0x07E0 : t < 75 ? (uint16_t)0xFFE0 : t < 90 ? (uint16_t)0xFD20 : (uint16_t)0xF800;
+    hud.setTextColor((uint16_t)TFT_LIGHTGREY);
+    hud.setCursor(x, y); hud.print(tempNames[i]);
+    int w = constrain((int)((t - 30.0f) / 65.0f * 52.0f), 1, 52);
+    hud.fillRect(x + 32, y + 1, 52, 5, (uint16_t)0x2104);
+    hud.fillRect(x + 32, y + 1, w, 5, c);
+    hud.setTextColor(c);
+    hud.setCursor(x + 88, y);
+    hud.printf("%2.0fC", t);
+  }
 }
 
 void serviceHud(bool force = false) {
@@ -800,6 +841,7 @@ bool optCommand(uint8_t c) {
     case '8': cycleBrightness(); haptic(); return true;
     case '7': { uint8_t show = !cursorShown; sendMsg('C', &show, 1); haptic(); return true; }
     case '6': fpsCapIdx = (fpsCapIdx + 1) % 5; sendFpsCap(); saveSettings(); hudDirty = true; haptic(); return true;
+    case '5': hudPage ^= 1; saveSettings(); hudDirty = true; haptic(); return true;
     case KEY_ENTER: sendMsg('R', nullptr, 0); haptic(); return true;
     case '[': case ']':
       volume = c == '[' ? (volume > 16 ? volume - 16 : 0) : min(255, volume + 16);
@@ -1049,6 +1091,25 @@ void rxTask(void*) {
         }
         break;
       }
+      case 'M': {  // temperatures
+        uint8_t cnt;
+        if (!(ok = rxRead(&cnt, 1))) break;
+        uint8_t stored = 0;
+        for (uint8_t i = 0; i < cnt && ok; ++i) {
+          uint8_t nl, name[32], tv[2];
+          if (!(ok = rxRead(&nl, 1))) break;
+          if (nl > sizeof(name)) { rxError = "Protocol error"; ok = false; break; }
+          if (!(ok = rxRead(name, nl)) || !(ok = rxRead(tv, 2))) break;
+          if (stored < MAX_TEMPS) {
+            uint8_t k = min<uint8_t>(nl, 12);
+            memcpy(tempNames[stored], name, k); tempNames[stored][k] = 0;
+            tempX10[stored] = (int16_t)(tv[0] | (tv[1] << 8));
+            ++stored;
+          }
+        }
+        if (ok) { tempCount = stored; tempsAt = millis(); }
+        break;
+      }
       case 'H':
         break;
       case 'X':
@@ -1137,6 +1198,7 @@ void runSession() {
 
   sendQuality();
   sendFpsCap();
+  { uint8_t want = 1; sendMsg('G', &want, 1); }  // temperatures for the Opt+5 gauges
   sendSoundWanted();
   hudDirty = true;
   haptic(40);
