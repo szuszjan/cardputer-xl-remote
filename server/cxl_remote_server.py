@@ -46,7 +46,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -438,6 +438,8 @@ class Session:
         if not self.alive:
             return
         self.alive = False
+        if getattr(self, "ready", False) and self.server.matrix:
+            self.server.matrix.event("disconnected")
         # Goodbye only if the socket is free soon - never hang on a stuck client.
         if reason is not None and self.send_lock.acquire(timeout=0.5):
             try:
@@ -806,6 +808,15 @@ class LedMatrix:
             self.connect_started = now
             self.searching_until = now + 5.0
             self.event_kind = None
+        elif kind == "disconnected":
+            # whatever is on the matrix now crumbles: every lit pixel drops
+            # after its own random delay
+            import random
+            snap = self.last_frame or bytes(MX_W * MX_H)
+            self.crumble = [(i % MX_W, i // MX_W, v, random.uniform(0.0, 0.7))
+                            for i, v in enumerate(snap) if v]
+            self.event_kind, self.event_at = kind, now
+            self.searching_until = 0.0
         else:
             self.event_kind = kind
             self.event_at = max(now, self.connect_started + 1.0)
@@ -886,6 +897,15 @@ class LedMatrix:
             if 0.5 < t < 0.8:
                 for i in range(len(f)):
                     f[i] = max(f[i], 1)          # brief flash of the whole matrix
+        elif self.event_kind == "disconnected":
+            for x, y, v, delay in getattr(self, "crumble", ()):
+                if t < delay:
+                    yy = y
+                else:
+                    dt = t - delay
+                    yy = int(y + 18 * dt * dt + 2 * dt)   # accelerating fall
+                if yy < MX_H:
+                    f[yy * MX_W + x] = max(f[yy * MX_W + x], v)
         else:  # failed: blinking X
             if int(t * 4) % 2 == 0:
                 for x, y in self.CROSS:
