@@ -46,7 +46,7 @@ import time
 
 from PIL import Image, ImageDraw
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROTO_VER = 3
 PORT = 5901
 TILE_W, TILE_H = 32, 16              # dirty-region grid (JPEG MCU friendly)
@@ -484,6 +484,8 @@ class Session:
             expect = hmac.new(pin.encode(), nonce, hashlib.sha256).digest()
             if not hmac.compare_digest(expect, hello[13:45]):
                 self.send(b"X\x01")
+                if self.server.matrix:
+                    self.server.matrix.event("failed")
                 raise ConnectionError("wrong PIN")
         name = socket.gethostname().encode()[:63]
         mon = monitors[self.mon_idx % len(monitors)]
@@ -672,6 +674,9 @@ class Session:
             monitors = sct.monitors[1:] or sct.monitors
             self.handshake(monitors)
             log(f"{self.addr[0]}: connected ({self.ow}x{self.oh} panel)")
+            self.ready = True
+            if self.server.matrix:
+                self.server.matrix.event("connected")
             threading.Thread(target=self.reader, daemon=True).start()
             prev = None
             last_send = last_change = time.monotonic()
@@ -767,7 +772,7 @@ FONT5x7 = {  # 5 columns x 7 rows, bit 4 = leftmost column
     "3": (31, 2, 4, 2, 1, 17, 14), "4": (2, 6, 10, 18, 31, 2, 2), "5": (31, 16, 30, 1, 1, 17, 14),
     "6": (6, 8, 16, 30, 17, 17, 14), "7": (31, 1, 2, 4, 8, 8, 8), "8": (14, 17, 17, 14, 17, 17, 14),
     "9": (14, 17, 17, 15, 1, 2, 12), "P": (30, 17, 17, 30, 16, 16, 16), "I": (14, 4, 4, 4, 4, 4, 14),
-    "N": (17, 25, 21, 19, 17, 17, 17), " ": (0, 0, 0, 0, 0, 0, 0),
+    "N": (17, 25, 21, 19, 17, 17, 17), " ": (0, 0, 0, 0, 0, 0, 0), ":": (0, 12, 12, 0, 12, 12, 0),
 }
 FONT3x5 = {  # 3 columns x 5 rows, bit 2 = leftmost column
     "0": (7, 5, 5, 5, 7), "1": (2, 6, 2, 2, 7), "2": (7, 1, 7, 4, 7), "3": (7, 1, 7, 1, 7),
@@ -786,6 +791,19 @@ class LedMatrix:
         self.peak = 1e-3              # slow auto-gain for the spectrum
         self.last_loud = 0.0
         self.np = None
+        self.searching_until = 0.0    # Cardputer discovery pings / TCP connect in progress
+        self.event_kind, self.event_at = None, 0.0   # "connected" / "failed" one-shot animations
+        self.tz_checked = 0.0
+
+    def event(self, kind):
+        """Hooks from the server: 'search' (discovery ping or connect started),
+        'connected' (handshake ok), 'failed' (wrong PIN)."""
+        now = time.monotonic()
+        if kind == "search":
+            self.searching_until = now + 3.0
+        else:
+            self.searching_until = 0.0
+            self.event_kind, self.event_at = kind, now
 
     @staticmethod
     def available():
@@ -824,19 +842,48 @@ class LedMatrix:
                     f[(r + 1) * MX_W + x] = 7
         return bytes(f)
 
-    def _clock_frame(self):
+    def _clock_text(self):
+        # The process keeps the timezone it started with; re-read it once a
+        # minute so `timedatectl set-timezone` takes effect without a restart.
+        if time.monotonic() - self.tz_checked > 60:
+            if hasattr(time, "tzset"):
+                time.tzset()
+            self.tz_checked = time.monotonic()
         t = time.localtime()
-        digits = f"{t.tm_hour:02d}{t.tm_min:02d}"
+        return f"{t.tm_hour:02d}:{t.tm_min:02d}   "
+
+    def _ripple_frame(self, t):
+        # "Looking for / connecting to the Cardputer": rings spreading from
+        # the bottom centre, like a Wi-Fi symbol being drawn over and over.
         f = bytearray(MX_W * MX_H)
-        # 3+3 | colon | 3+3 = 13 columns, no gaps: tens bright, ones dimmer.
-        for i, (d, x0) in enumerate(zip(digits, (0, 3, 7, 10))):
-            g, lvl = FONT3x5[d], (7 if i % 2 == 0 else 3)
-            for r in range(5):
-                for c in range(3):
-                    if (g[r] >> (2 - c)) & 1:
-                        f[(r + 1) * MX_W + x0 + c] = lvl
-        if t.tm_sec % 2 == 0:
-            f[2 * MX_W + 6] = f[4 * MX_W + 6] = 5
+        for y in range(MX_H):
+            for x in range(MX_W):
+                d = ((x - 6) ** 2 + ((y - 7) * 1.3) ** 2) ** 0.5
+                ph = (d - t * 7.0) % 3.0
+                if ph < 1.0:
+                    f[y * MX_W + x] = max(1, 7 - int(d * 0.6))
+        return bytes(f)
+
+    CHECK = ((2, 4), (3, 5), (4, 6), (5, 5), (6, 4), (7, 3), (8, 2), (9, 1), (10, 0))
+    CROSS = tuple((3 + i, 1 + i) for i in range(6)) + tuple((8 - i, 1 + i) for i in range(6))
+
+    def _event_frame(self, t):
+        f = bytearray(MX_W * MX_H)
+        if self.event_kind == "connected":
+            # tick drawn in over 0.5 s, then a short glow around it
+            n = min(len(self.CHECK), int(t / 0.5 * len(self.CHECK)) + 1)
+            glow = 7 if t < 0.5 else (7 if int(t * 6) % 2 == 0 else 4)
+            for x, y in self.CHECK[:n]:
+                f[y * MX_W + x] = glow
+                if y + 1 < MX_H:
+                    f[(y + 1) * MX_W + x] = 3   # second row thickens the stroke
+            if 0.5 < t < 0.8:
+                for i in range(len(f)):
+                    f[i] = max(f[i], 1)          # brief flash of the whole matrix
+        else:  # failed: blinking X
+            if int(t * 4) % 2 == 0:
+                for x, y in self.CROSS:
+                    f[y * MX_W + x] = 7
         return bytes(f)
 
     def _spectrum_frame(self):
@@ -878,19 +925,31 @@ class LedMatrix:
     def _loop(self):
         offset = 0
         tick = 0
+        mode = None
         while True:
             try:
+                now = time.monotonic()
                 s = self.server.session
-                if not (s and s.alive):
+                ready = bool(s and s.alive and getattr(s, "ready", False))
+                if self.event_kind and now - self.event_at < 1.6:
+                    new_mode, frame = "event", self._event_frame(now - self.event_at)
+                elif now < self.searching_until and not ready:
+                    new_mode, frame = "search", self._ripple_frame(now)
+                elif ready and now - self.last_loud < 2.0:
+                    new_mode, frame = "spectrum", self._spectrum_frame()
+                else:
                     cfg = self.server.cfg
-                    frame = self._text_frame(f"PIN {cfg['pin']}  " if cfg["require_pin"] else " ", offset)
+                    if ready:
+                        new_mode, text = "clock", self._clock_text()
+                    else:
+                        new_mode, text = "pin", (f"PIN {cfg['pin']}   " if cfg["require_pin"] else " ")
+                    if new_mode != mode:
+                        offset = 0
+                    frame = self._text_frame(text, offset)
                     tick += 1
                     if tick % 2 == 0:
                         offset += 1
-                elif time.monotonic() - self.last_loud < 2.0:
-                    frame = self._spectrum_frame()
-                else:
-                    frame = self._clock_frame()
+                mode = new_mode
                 if frame != self.last_frame:
                     self._send(frame)
                     self.last_frame = frame
@@ -1021,6 +1080,8 @@ class RemoteServer:
             try:
                 data, addr = udp.recvfrom(64)
                 if data.startswith(b"CXLR?"):
+                    if self.matrix:
+                        self.matrix.event("search")
                     udp.sendto(b"CXLR!" + struct.pack("<H", port) + name, addr)
             except OSError:
                 if not self.running:
@@ -1038,6 +1099,8 @@ class RemoteServer:
             if old and old.alive:
                 log(f"{old.addr[0]}: replaced by {addr[0]}")
                 old.close(reason=2)
+            if self.matrix:
+                self.matrix.event("search")
             sess = Session(sock, addr, self)
             self.session = sess
             threading.Thread(target=self._run_session, args=(sess,), daemon=True).start()
