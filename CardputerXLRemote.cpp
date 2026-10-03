@@ -42,6 +42,13 @@
 //   Opt + 9  image quality                   Opt + 8  backlight
 //   Opt + Enter  full refresh                Opt + `  disconnect
 //   Opt + [ / ]  volume down / up            Opt + \  sound on/off
+//   Opt + 7  show / hide the mouse cursor
+//
+// HOTSPOT ("proxy") MODE - picker menu: the Cardputer stays on the main
+// Wi-Fi AND runs its own access point (192.168.77.1/24) for the server, e.g.
+// an Arduino UNO Q, routing that network's traffic out through the main
+// Wi-Fi with NAT. The server then talks to the Cardputer over a direct link,
+// and still has internet. With no main Wi-Fi it works as an offline link.
 //   MOUSE mode: ; . , / move (accelerates, Shift = slow), Enter/Space = left
 //   button (hold to drag), \ = right, ' = middle, [ ] = wheel. Every other
 //   key still types.
@@ -74,7 +81,7 @@
 constexpr uint16_t REMOTE_PORT = 5901;       // TCP session + UDP discovery
 constexpr uint16_t DISCOVERY_LOCAL_PORT = 5902;
 constexpr uint8_t PROTO_VER = 3;
-#define CXL_REMOTE_VERSION "1.1.0"
+#define CXL_REMOTE_VERSION "1.2.0"
 constexpr int OUT_W = 320, OUT_H = 240;
 constexpr uint32_t JPEG_MAX = 48 * 1024;     // server splits tiles to fit
 constexpr uint32_t BL_HZ = 5000;
@@ -171,7 +178,8 @@ String wifiSsid, wifiPass, serverPin;
 IPAddress lastServerIp;
 uint16_t lastServerPort = REMOTE_PORT;
 uint8_t rotation = 3, brightness = 10, quality = 1, volume = 128;
-bool soundOn = true;
+bool soundOn = true, hotspotOn = false;
+String apSsid, apPass;
 const char* qualityNames[] = {"FAST", "NORMAL", "SHARP"};
 
 // ---- Session / HUD state ----
@@ -180,7 +188,7 @@ uint16_t serverScreenW = 0, serverScreenH = 0;
 bool mouseMode = false, inSession = false, hudDirty = true;
 uint16_t viewRatioX100 = 0;
 uint8_t zoomIdx = 0, zoomCount = 1, monitorNo = 1;
-bool stretchOn = false, audioStreaming = false;
+bool stretchOn = false, audioStreaming = false, cursorShown = true;
 uint32_t statFrames = 0, statBytes = 0, statT0 = 0;
 float fps = 0, kbps = 0;
 String lastKeyLabel;
@@ -207,6 +215,9 @@ void saveSettings() {
   prefs.putUChar("quality", quality);
   prefs.putUChar("volume", volume);
   prefs.putBool("sound", soundOn);
+  prefs.putBool("hotspot", hotspotOn);
+  prefs.putString("ap_ssid", apSsid);
+  prefs.putString("ap_pass", apPass);
   prefs.end();
 }
 
@@ -222,6 +233,9 @@ void loadSettings() {
     quality = min<uint8_t>(prefs.getUChar("quality", 1), 2);
     volume = prefs.getUChar("volume", volume);
     soundOn = prefs.getBool("sound", soundOn);
+    hotspotOn = prefs.getBool("hotspot", false);
+    apSsid = prefs.getString("ap_ssid", "");
+    apPass = prefs.getString("ap_pass", "");
     prefs.end();
   }
   // CardputerXL's own settings: Wi-Fi it already knows, panel rotation and
@@ -308,9 +322,14 @@ void drawHud() {
       hud.setCursor(4, 64); hud.print("Wi-Fi: " + WiFi.SSID().substring(0, 30));
       hud.setCursor(4, 76); hud.print("IP:    " + WiFi.localIP().toString());
     }
+    if (hotspotOn) {
+      hud.setTextColor((uint16_t)0xFC60);
+      hud.setCursor(4, 88); hud.print(("Hotspot: " + apSsid).substring(0, 39));
+      hud.setCursor(4, 100); hud.print(("Pass: " + apPass + "  clients: " + String(WiFi.softAPgetStationNum())).substring(0, 39));
+    }
     hud.setTextColor((uint16_t)0x8C71);
     hud.setCursor(4, 112); hud.print("Use the big screen. ` = back");
-    hud.setCursor(4, 124); hud.print("PC: python cxl_remote_server.py");
+    hud.setCursor(4, 124); hud.print("PC: run CXLRemoteServer.exe");
     hud.pushSprite(0, 0);
     return;
   }
@@ -343,7 +362,7 @@ void drawHud() {
   static const char* keyHints[] = {"Fn+;.,/ arrows  Fn+` Esc  Fn+1-= F1-12",
                                    "Fn+Del Del Fn+[] PgUp/Dn Opt+[]\\ sound",
                                    "Opt=Win Opt+Spc/G0 mouse Opt+-= zoom",
-                                   "Opt+0 fit/stretch Opt+9 qual Opt+` quit"};
+                                   "Opt+0 fit Opt+7 cursor Opt+9 q Opt+` quit"};
   static const char* mouseHints[] = {";.,/ move (Shift slow)  Ent/Spc left",
                                      "\\ right  ' middle  [ ] wheel  hold=drag",
                                      "Opt+Spc/G0 keybd  Opt+-= zoom  Opt+0 fit",
@@ -462,12 +481,49 @@ bool textInput(const char* title, const String& label, String& value, bool secre
 // ============================================================================
 // Wi-Fi
 // ============================================================================
+const IPAddress AP_IP(192, 168, 77, 1);
+
+void ensureApCredentials() {
+  if (apSsid.isEmpty()) {
+    char id[8];
+    snprintf(id, sizeof(id), "%04X", (uint16_t)(ESP.getEfuseMac() >> 32));
+    apSsid = String("CXL-Remote-") + id;
+  }
+  if (apPass.length() < 8) {
+    const char* abc = "abcdefghjkmnpqrstuvwxyz23456789";
+    apPass = "";
+    for (int i = 0; i < 10; ++i) apPass += abc[esp_random() % 31];
+  }
+}
+
+// Own access point for the server, with NAT out through the main Wi-Fi.
+void startHotspot() {
+  ensureApCredentials();
+  if (!(WiFi.getMode() & WIFI_AP)) WiFi.mode(WIFI_AP_STA);
+  IPAddress dns = WiFi.status() == WL_CONNECTED ? WiFi.dnsIP() : IPAddress(1, 1, 1, 1);
+  if (dns == IPAddress((uint32_t)0)) dns = IPAddress(1, 1, 1, 1);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0), IPAddress(192, 168, 77, 10), dns);
+  // The AP follows the main network's channel once the station is connected.
+  WiFi.softAP(apSsid.c_str(), apPass.c_str(), 1, 0, 4);
+  WiFi.AP.enableNAPT(WiFi.status() == WL_CONNECTED);
+  udp.begin(DISCOVERY_LOCAL_PORT);
+}
+
+void stopHotspot() {
+  WiFi.AP.enableNAPT(false);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+}
+
 bool connectWifi() {
-  if (wifiSsid.isEmpty()) return false;
+  if (wifiSsid.isEmpty()) {
+    if (hotspotOn) { startHotspot(); return true; }  // offline link only
+    return false;
+  }
   uiMessage("WI-FI", "Connecting to", "", C_DIM, "` cancel -> Wi-Fi setup");
   uiText(10, 76, wifiSsid.substring(0, 25), C_ACC);
   setStatus("Wi-Fi...", wifiSsid);
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(hotspotOn ? WIFI_AP_STA : WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);  // modem sleep adds ~100 ms of input latency
@@ -475,9 +531,11 @@ bool connectWifi() {
   uint32_t t0 = millis();
   int dots = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > 20000) return false;
+    // In hotspot mode a missing main network is not fatal: the AP still
+    // gives the server a direct (offline) link to the Cardputer.
+    if (millis() - t0 > 20000) { if (hotspotOn) { startHotspot(); return true; } return false; }
     UiKey k = uiPoll();
-    if (k.base == '`') return false;
+    if (k.base == '`') { if (hotspotOn) { startHotspot(); return true; } return false; }
     if ((millis() - t0) / 400 != (uint32_t)dots) {
       dots = (millis() - t0) / 400;
       tft.fillRect(10, 110, 300, 8, C_BG);
@@ -487,6 +545,7 @@ bool connectWifi() {
     delay(20);
   }
   udp.begin(DISCOVERY_LOCAL_PORT);
+  if (hotspotOn) startHotspot();
   return true;
 }
 
@@ -535,7 +594,8 @@ std::vector<ServerInfo> servers;
 void discoveryBroadcast() {
   const uint8_t q[] = {'C', 'X', 'L', 'R', '?'};
   udp.beginPacket(IPAddress(255, 255, 255, 255), REMOTE_PORT); udp.write(q, sizeof(q)); udp.endPacket();
-  udp.beginPacket(WiFi.broadcastIP(), REMOTE_PORT); udp.write(q, sizeof(q)); udp.endPacket();
+  if (WiFi.status() == WL_CONNECTED) { udp.beginPacket(WiFi.broadcastIP(), REMOTE_PORT); udp.write(q, sizeof(q)); udp.endPacket(); }
+  if (hotspotOn) { udp.beginPacket(IPAddress(192, 168, 77, 255), REMOTE_PORT); udp.write(q, sizeof(q)); udp.endPacket(); }
 }
 
 bool discoveryPoll() {
@@ -698,6 +758,7 @@ bool optCommand(uint8_t c) {
     case '1': sendMsg('N', nullptr, 0); haptic(); return true;
     case '9': quality = (quality + 1) % 3; sendQuality(); saveSettings(); hudDirty = true; haptic(); return true;
     case '8': cycleBrightness(); haptic(); return true;
+    case '7': { uint8_t show = !cursorShown; sendMsg('C', &show, 1); haptic(); return true; }
     case KEY_ENTER: sendMsg('R', nullptr, 0); haptic(); return true;
     case '[': case ']':
       volume = c == '[' ? (volume > 16 ? volume - 16 : 0) : min(255, volume + 16);
@@ -995,9 +1056,9 @@ bool serviceRx() {
       case 'F': {
         sendMsg('A', it.hdr, 4);  // ack only after every tile of the frame is on screen
         uint16_t ratio = rd16(it.hdr + 4);
-        bool stretch = it.hdr[10] & 1, audio = it.hdr[10] & 2;
-        if (ratio != viewRatioX100 || it.hdr[6] != zoomIdx || it.hdr[9] != monitorNo || stretch != stretchOn || audio != audioStreaming) hudDirty = true;
-        stretchOn = stretch; audioStreaming = audio;
+        bool stretch = it.hdr[10] & 1, audio = it.hdr[10] & 2, cursor = !(it.hdr[10] & 4);
+        if (ratio != viewRatioX100 || it.hdr[6] != zoomIdx || it.hdr[9] != monitorNo || stretch != stretchOn || audio != audioStreaming || cursor != cursorShown) hudDirty = true;
+        stretchOn = stretch; audioStreaming = audio; cursorShown = cursor;
         viewRatioX100 = ratio; zoomIdx = it.hdr[6]; zoomCount = it.hdr[7]; monitorNo = it.hdr[9];
         if (it.hdr[8] != quality && it.hdr[8] < 3) { quality = it.hdr[8]; hudDirty = true; }
         ++statFrames;
@@ -1093,7 +1154,7 @@ bool pickServer() {
   uint32_t lastBroadcast = 0;
   bool dirty = true;
   uiHeader("REMOTE DESKTOP");
-  uiFooter("ENTER connect  M manual IP  P PIN  W Wi-Fi  ` rescan");
+  uiFooter("ENTER connect  M manual IP  P PIN  W Wi-Fi  H hotspot  ` rescan");
   setStatus("Pick a PC", "Searching the network...");
   while (true) {
     uint32_t now = millis();
@@ -1104,6 +1165,8 @@ bool pickServer() {
     items.push_back("Manual IP...");
     items.push_back("Server PIN...");
     items.push_back("Wi-Fi setup...");
+    items.push_back(String("Hotspot for PC: ") + (hotspotOn ? "ON" : "OFF"));
+    if (hotspotOn) items.push_back("Hotspot name/password...");
     if (sel >= (int)items.size()) sel = items.size() - 1;
     if (dirty) {
       uiDrawList(items, sel, top);
@@ -1113,7 +1176,7 @@ bool pickServer() {
     serviceHud(); serviceHaptic();
     UiKey k = uiPoll();
     if (k.idx < 0) { delay(10); continue; }
-    int action = -1;  // 0..n-1 server, n manual, n+1 pin, n+2 wifi
+    int action = -1;  // 0..n-1 server, n manual, n+1 pin, n+2 wifi, n+3 hotspot, n+4 hotspot creds
     int n = servers.size();
     if (k.base == ';' && sel > 0) { --sel; dirty = true; }
     else if (k.base == '.' && sel + 1 < (int)items.size()) { ++sel; dirty = true; }
@@ -1121,6 +1184,7 @@ bool pickServer() {
     else if (k.base == 'm') action = n;
     else if (k.base == 'p') action = n + 1;
     else if (k.base == 'w') action = n + 2;
+    else if (k.base == 'h') action = n + 3;
     else if (k.base == '`') { servers.clear(); sel = 0; dirty = true; }
     if (action < 0) continue;
     if (action < n) {
@@ -1134,12 +1198,30 @@ bool pickServer() {
     } else if (action == n + 1) {
       String pin = serverPin;
       if (textInput("SERVER PIN", "PIN printed by cxl_remote_server.py", pin, false, 16)) { serverPin = pin; saveSettings(); }
-    } else {
+    } else if (action == n + 2) {
       wifiSetup();
       while (!connectWifi()) wifiSetup();
+    } else if (action == n + 3) {
+      hotspotOn = !hotspotOn;
+      if (hotspotOn) {
+        startHotspot();
+        uiMessage("HOTSPOT ON", apSsid, "Password: " + apPass + "   PC/UNO Q joins this network.", C_OK, "any key: back");
+        waitAnyKey(15000);
+      } else {
+        stopHotspot();
+      }
+      saveSettings();
+      servers.clear();
+    } else if (hotspotOn) {
+      String ssid = apSsid, pass = apPass;
+      if (textInput("HOTSPOT NAME", "Network name for the PC to join", ssid, false, 31) && ssid.length() &&
+          textInput("HOTSPOT PASSWORD", "At least 8 characters", pass, false, 63) && pass.length() >= 8) {
+        apSsid = ssid; apPass = pass; saveSettings();
+        startHotspot();
+      }
     }
     uiHeader("REMOTE DESKTOP");
-    uiFooter("ENTER connect  M manual IP  P PIN  W Wi-Fi  ` rescan");
+    uiFooter("ENTER connect  M manual IP  P PIN  W Wi-Fi  H hotspot  ` rescan");
     dirty = true;
   }
 }
@@ -1199,7 +1281,7 @@ void loop() {
     // Unexpected drop: retry the same PC a few times before giving up.
     String why = connError;
     for (int attempt = 1; attempt <= 3 && byeReason == 255; ++attempt) {
-      if (WiFi.status() != WL_CONNECTED) while (!connectWifi()) wifiSetup();
+      if (WiFi.status() != WL_CONNECTED && !hotspotOn) while (!connectWifi()) wifiSetup();
       uiMessage("RECONNECTING", why, "attempt " + String(attempt) + "/3", C_ERR);
       delay(800);
       if (remoteConnect(lastServerIp, lastServerPort) == CONN_OK) { runSession(); if (!connError.length()) return; why = connError; attempt = 0; }

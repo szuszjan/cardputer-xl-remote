@@ -18,7 +18,7 @@ Protocol v3 (little-endian):
   then
   S->C  'T' x y w h:u16 len:u32 jpeg      tile
         'F' id:u32 ratio_x100:u16 zoom_idx zoom_count quality monitor flags (u8 each)
-            flags bit0 = stretch-to-fit active, bit1 = sound streaming
+            flags bit0 = stretch-to-fit active, bit1 = sound streaming, bit2 = cursor hidden
         'S' len:u16 audio                 24 kHz mono, continuous mu-law (mu=255) bytes
         'H'                               heartbeat
         'X' reason:u8                     goodbye (2 = replaced by another client)
@@ -26,6 +26,7 @@ Protocol v3 (little-endian):
         'K' down:u8 name    'M' dx8:i16 dy8:i16 (1/8 view px)   'B' button down
         'W' v:i8 h:i8       'Z' zoom:i8 (+1 in, -1 out, 0 fit; 0 at fit toggles stretch)
         'Q' quality         'N' next monitor    'R' full refresh   'U' want sound:u8
+        'C' show cursor:u8 (0 hides the pointer overlay)
         'A' frame ack id:u32   'P' ping
 """
 
@@ -56,7 +57,8 @@ REFINE_AFTER = 0.25        # ... and get re-sent sharp once the screen holds sti
 AUDIO_RATE, AUDIO_BLOCK = 24000, 480
 MAX_INFLIGHT = 2
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".cxl_remote.json")
-DEFAULTS = {"pin": "", "require_pin": True, "port": PORT, "fps": 25, "stretch": False, "audio": True}
+DEFAULTS = {"pin": "", "require_pin": True, "port": PORT, "fps": 25, "stretch": False, "audio": True,
+            "cursor": True}
 
 try:
     LANCZOS = Image.Resampling.LANCZOS
@@ -551,6 +553,11 @@ class Session:
             with self.lock:
                 self.force_full = True
             self.wake.set()
+        elif t == ord("C"):
+            self.server.remember(cursor=bool(p[0]))
+            with self.lock:
+                self.force_full = True
+            self.wake.set()
         elif t == ord("U"):
             self.sound_wanted = bool(p[0])
         elif t == ord("A"):
@@ -648,7 +655,8 @@ class Session:
                     img = img.resize((dw, dh), LANCZOS, reducing_gap=2.0)
                 self.cache_key, self.cache_raw, self.cache_img = key, raw, img
             canvas.paste(img, (round((ix0 - vx) / rx), round((iy0 - vy) / ry)))
-        draw_cursor(canvas, round((cx - vx) / rx), round((cy - vy) / ry))
+        if self.server.cfg["cursor"]:
+            draw_cursor(canvas, round((cx - vx) / rx), round((cy - vy) / ry))
         self.cur_ratio, self.cur_mon = (rx, ry), mon
         self.view_label = "STRETCH" if stretch else ("FIT" if zi == 0 else f"1:{rx:g}")
         return canvas, max(rx, ry), zi, len(ratios), stretch
@@ -713,7 +721,8 @@ class Session:
                             for (x0, y0, x1, y1), data in encode_rect(frame, rect, enc_q, enc_sub, self.maxjpeg):
                                 self.send(b"T" + struct.pack("<HHHHI", x0, y0, x1 - x0, y1 - y0, len(data)) + data)
                         self.sent_id += 1
-                        flags = (1 if stretch else 0) | (2 if self.audio_active else 0)
+                        flags = ((1 if stretch else 0) | (2 if self.audio_active else 0) |
+                                 (0 if self.server.cfg["cursor"] else 4))
                         self.send(b"F" + struct.pack("<IHBBBBB", self.sent_id, min(65535, round(ratio * 100)),
                                                      zi, zc, self.quality, self.mon_idx % len(monitors) + 1, flags))
                         self._stat_frames += 1
@@ -770,7 +779,7 @@ class RemoteServer:
             self.remember(**persist)
         s = self.session
         if s and s.alive:
-            s.update(**{k: v for k, v in kw.items() if k in ("monitor", "stretch", "quality")})
+            s.update(**{k: v for k, v in kw.items() if k in ("monitor", "stretch", "quality", "cursor")})
 
     def start(self):
         port = int(self.cfg["port"])

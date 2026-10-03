@@ -166,6 +166,9 @@ class App:
         self.var_audio = tk.BooleanVar(value=self.server.cfg["audio"])
         ttk.Checkbutton(ctl, text="Send PC sound to the Cardputer speaker", variable=self.var_audio,
                         command=lambda: self.server.set_option(audio=self.var_audio.get())).pack(anchor="w")
+        self.var_cursor = tk.BooleanVar(value=self.server.cfg["cursor"])
+        ttk.Checkbutton(ctl, text="Show the mouse cursor on the Cardputer", variable=self.var_cursor,
+                        command=lambda: self.server.set_option(cursor=self.var_cursor.get())).pack(anchor="w")
         self.var_viewonly = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctl, text="View only (ignore Cardputer keyboard / mouse)", variable=self.var_viewonly,
                         command=lambda: setattr(self.server, "view_only", self.var_viewonly.get())).pack(anchor="w")
@@ -271,6 +274,8 @@ class App:
                                       f"quality {core.QUALITY_NAMES[s.quality]}   "
                                       f"sound {'on' if s.audio_active else 'off'}   {up // 60}:{up % 60:02d}")
             # follow changes the Cardputer made itself
+            if self.var_cursor.get() != self.server.cfg["cursor"]:
+                self.var_cursor.set(self.server.cfg["cursor"])
             if self.var_stretch.get() != s.stretch:
                 self.var_stretch.set(s.stretch)
             if self.cb_q.current() != s.quality:
